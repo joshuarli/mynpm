@@ -1,0 +1,25 @@
+# Replace __SITE_ROOT__ with the absolute path to the generated site.
+# Replace __PORT__ with a suitable HTTP port for local testing.
+worker_processes 1;
+pid __PID_FILE__;
+error_log __ERROR_LOG__;
+events { worker_connections 128; }
+http {
+  access_log __ACCESS_LOG__;
+  server {
+    listen 127.0.0.1:__PORT__;
+    root __SITE_ROOT__;
+    # Static metadata (no .json suffix), including encoded scoped names.
+    location ^~ /mirror/current/ {
+      default_type application/json;
+      add_header Cache-Control "no-cache";
+      try_files $uri =404;
+    }
+    # Tarballs are named by SHA-512 content digest and never change.
+    location ^~ /mirror/tarballs/ {
+      default_type application/octet-stream;
+      add_header Cache-Control "public, max-age=31536000, immutable";
+      try_files $uri =404;
+    }
+  }
+}

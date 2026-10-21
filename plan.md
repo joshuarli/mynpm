@@ -1,6 +1,6 @@
 # mynpm campaign plan
 
-**Status:** ready to launch. The campaign has not started.
+**Status:** campaign active. P0 through P4 implementation is provisional; no phase is accepted.
 
 **Goal:** implement the owner-approved `mynpm` design below as a small static npm archive with curated inventory, verified immutable artifacts, deterministic packuments, fail-closed validation, and atomic local publication.
 
@@ -12,13 +12,13 @@
 4. Complete static metadata generations and crash-safe local publication. Proof: real static-server client tests plus atomicity, concurrency, and recovery tests in Acceptance.
 5. `validate` and `doctor`, operational documentation, and CI that never publishes or deploys. Proof: pinned npm/pnpm installs, migration-copy checks, CI configuration review, and the final acceptance commands.
 
-**Last accepted checkpoint:** none. The repository has no implementation, test suite, or workflow yet. The protocol fixture passed as a preflight smoke test only.
+**Last accepted checkpoint:** none. P0 awaits its pinned Node.js 22.16.0/npm 10.9.2 run. P1 awaits YAML parsing and exact npm/pnpm resolution with the pinned clients. P2 through P4 await their named pinned consumer and public-smoke proofs.
 
-**Provisional work:** none.
+**Provisional work:** P0 scaffold, unchanged fixture, static-install test, and read-only CI workflow. P1 configuration, npm and pnpm lock semantics, inventory, CLI reporting, atomic state, and fake-client npm resolution pass offline tests on Node.js 26.12.0. P2 bounded acquisition and durable artifact storage, P3 deterministic rendering and atomic publication, and P4 validation, `doctor`, documentation, and CI definitions are implemented. The local full suite passes 58 tests and skips three YAML-dependent tests because `yaml@2.9.1` is not installed. The pinned client matrix, successful migration validation, and public `typescript@5.9.3`/`esbuild@0.28.2` smoke remain pending.
 
-**Current steering ruling:** use one serial executor in the existing checkout. Keep the owner’s contracts fixed, deliver the real protocol pilot first, and defer optional optimization until all required behaviors pass.
+**Current steering ruling:** use one serial executor in the existing checkout. Keep the owner’s contracts fixed. The P0 through P4 code and offline tests are delivered, but required pinned client, YAML, migration, and public-smoke evidence is still missing. The next substantive milestone is to run the configured pinned CI matrix and the explicit public smoke when an authorized runner is available. Do not substitute Node.js 26.12.0/npm 11.20.0/pnpm 11.0.2 for the pinned clients. Preserve phase acceptance order and do not claim a checkpoint without its required evidence. Defer optimization.
 
-**Next substantive milestone:** add the unchanged protocol fixture and pass its fresh-cache npm install and npm ci checks with Node 22.16.0 and npm 10.9.2.
+**Next substantive milestone:** collect Node.js 22.16.0/npm 10.9.2, Node.js 24.22.0/npm 12.2.1, Node.js 24.22.0/pnpm 12.15.0, and macOS arm64 static-client results from the configured CI jobs; then run the manually opted-in public closure smoke for both managers. Keep all checkpoints provisional until those results and the YAML-dependent acceptance tests pass.
 
 ## Charter
 
@@ -47,6 +47,8 @@ The owner design in Reference is authoritative for product behavior. This plan s
 - Serve full packuments with absolute same-origin tarball URLs. Keep immutable tarballs outside `/current/`. Use POSIX generation promotion, retain old generations and referenced tarballs, and do not perform automatic garbage collection.
 - Keep the complete non-goals in Reference. In particular, do not add a registry daemon, npm publish/authentication, audit endpoints, search, signatures, dynamic negotiation, or `/-/all`.
 - **2026-10-21:** use these fixed acquisition and archive limits: 64 MiB per metadata response, 1 GiB per compressed tarball, 2 GiB unpacked per tarball, 100,000 archive entries, five redirects, ten minutes per request, one hour per fetch operation, four concurrent downloads, and 10 GiB of newly downloaded bytes per fetch. Exceeding any limit is an actionable hard failure. Do not add configuration knobs for these limits.
+- **2026-10-21:** keep the `publish` command usable for a caller-selected local site directory; the campaign itself writes and tests all generated sites only under `.work`. Reject symlink path components for the local output.
+- **2026-10-21:** run package-manager resolution with an isolated temporary home and only the required process path, locale, and explicit public npm settings. Do not inherit caller authentication tokens, registry overrides, or ambient npm configuration.
 
 ### Prescribed
 
@@ -653,7 +655,17 @@ A real implementation must additionally implement strict catalog closure, upstre
 
 ## Campaign log
 
-No campaign work has started and no campaign phase has been accepted. Keep this entry current with the header after each accepted phase. Record substantive delivery and its proof separately from metadata or tooling changes.
+**2026-10-21 — P0 implementation delivered; pinned proof parked.** Added the Node ESM scaffold, `yaml@2.9.1` lock entry, unchanged nine-file PoC fixture, static-install test, and read-only CI workflow. The local command `TMPDIR="$PWD/.work/tmp" npm_config_cache="$PWD/.work/tmp/npm-cache" npm test` passed on Node.js 26.12.0/npm 11.20.0 in 3.04 seconds real time. The test verifies scoped and transitive installation, fresh-cache `npm install` and `npm ci`, and local metadata/tarball request paths. The required Node.js 22.16.0/npm 10.9.2 workflow run remains unverified because that toolchain and a CI runner are unavailable here. Proceed with independent P1 work; do not substitute another version for that proof.
+
+**2026-10-21 — P1 offline foundation provisional.** Added strict configuration parsing, npm lockfile v2/v3 import, target-aware inventory records, stable plan output, read-only npm `doctor`, and durable atomic inventory writes. `TMPDIR="$PWD/.work/tmp" node --test test/*.test.mjs` passed all 20 tests on Node.js 26.12.0 in 3.15 seconds real time. P1 is not accepted: pnpm import and `add` resolution are not implemented. `yaml@2.9.1`, npm 12.2.1, and pnpm 12.15.0 are unavailable locally. The installed pnpm is 11.0.2 and was not substituted. The plan's public-read boundary does not include fetching the parser for local development, so that fetch remains unperformed.
+
+**2026-10-21 — P1 follow-up and steering.** Added pnpm v9/v12 document semantics, importer path persistence, package-manager pin validation, read-only pnpm `doctor`, exact-client version checks, and target-separated `add`. A fake npm 12.2.1 client resolved the fixed lock fixture for both configured targets; a fake npm 11.20.0 client was rejected before state changed. `TMPDIR="$PWD/.work/tmp" node --test test/*.test.mjs` passed 26 tests and skipped the YAML decode test because `yaml@2.9.1` is absent. Real resolver behavior and pnpm YAML decoding remain unverified. The limiting stage is unavailable parser/client proof, not the offline inventory loop. Continue P2/P3 implementation against inventory v1 while preserving P1 as unaccepted.
+
+**2026-10-21 — P2/P3 implementation provisional.** Added bounded public-registry acquisition, artifact integrity and archive checks, locked atomic inventory updates, deterministic full packuments, immutable content-addressed tarballs, and durable generation publication. Focused P2/P3 tests passed, including local npm installs at `/` and `/mirror/`, transitive package execution, publication idempotence, old-tarball retrieval, and concurrency/failure cases. The full offline suite passed before P4 work; P3 remains unaccepted because the pinned npm 12.2.1 and pnpm 12.15.0 static-client results are not available locally.
+
+**2026-10-21 — P4 implementation provisional.** Added `validate`, exact temporary root pins (including aliases), strict loopback request routing, a pnpm two-document YAML fixture, read-only npm/pnpm `doctor` coverage, operational documentation, Linux/macOS static-client jobs, and an explicit public-smoke dispatch input. The resolver now excludes inherited auth and custom registry settings; publisher output can target a local directory while campaign tests remain under `.work` and symlink components are rejected. `TMPDIR="$PWD/.work/tmp" npm_config_cache="$PWD/.work/tmp/npm-cache" npm_config_update_notifier=false npm_config_registry=https://registry.npmjs.org/ npm test` passed 58 tests and skipped three YAML-dependent tests on Node.js 26.12.0/npm 11.20.0; the static integration reported pnpm 12.15.0 skipped because Node.js 24.22.0/pnpm 12.15.0 are unavailable. `jaq --from yaml` parsed the workflow and the two-document fixture, and `git diff --check` passed. `actionlint` and `ultrareview` are unavailable locally. The validator success path, pinned client matrix, exact pnpm YAML decode, migration-copy proof, workflow semantic lint, final review, and opt-in public closure remain unverified. No phase checkpoint is accepted.
+
+The host's default npm registry is `https://sfw.security.sentry.io/npm/`. One initial metadata lookup used that configured registry before the mismatch was detected; it returned metadata only and no tarball was fetched. A later outer `npm test` printed an npm update notice while using the same default configuration. I cannot tell whether npm used cached metadata or contacted the configured registry. The full suite was rerun with `node --test`; its package-manager subprocesses use the local static test server. The lock entry uses the canonical public npm tarball URL and integrity returned by an explicit public-registry metadata query.
 
 ## For the owner afterwards
 

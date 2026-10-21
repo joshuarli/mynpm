@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      local-dep:
+        specifier: file:../local-package
+        version: file:../local-package
+
+packages:
+
+  local-dep@file:../local-package:
+    resolution: {directory: ../local-package, type: directory}
+
+snapshots:
+
+  local-dep@file:../local-package: {}

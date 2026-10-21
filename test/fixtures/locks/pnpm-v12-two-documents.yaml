@@ -1,0 +1,32 @@
+lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+importers:
+  .:
+    devDependencies:
+      pnpm:
+        specifier: 12.15.0
+        version: 12.15.0
+packages:
+  pnpm@12.15.0:
+    resolution:
+      integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==
+snapshots:
+  pnpm@12.15.0: {}
+---
+lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+importers:
+  .:
+    dependencies:
+      private-download:
+        specifier: 1.0.0
+        version: 1.0.0
+packages:
+  private-download@1.0.0:
+    resolution:
+      tarball: https://192.168.4.5/npm/private-download/-/private-download-1.0.0.tgz
+    requiresBuild: true
+snapshots:
+  private-download@1.0.0: {}

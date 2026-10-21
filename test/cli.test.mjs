@@ -1,0 +1,277 @@
+import assert from 'node:assert/strict';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+const scratchRoot = join(repositoryRoot, '.work', 'tmp');
+const cliPath = join(repositoryRoot, 'src', 'cli.mjs');
+const configPath = join(repositoryRoot, 'test', 'fixtures', 'mynpm.json');
+const lockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'package-lock-v3.json');
+const addLockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'package-lock-add.json');
+const pnpmLockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'pnpm-v12-two-documents.yaml');
+
+let yamlAvailable = true;
+try {
+  await import('yaml');
+} catch (error) {
+  if (error.code === 'ERR_MODULE_NOT_FOUND') yamlAvailable = false;
+  else throw error;
+}
+
+function withScratch(run) {
+  mkdirSync(scratchRoot, { recursive: true });
+  const directory = mkdtempSync(join(scratchRoot, 'mynpm-cli-'));
+  try {
+    return run(directory);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function runCli(scratch, args, overrides = {}) {
+  const temporaryDirectory = join(scratch, 'tmp');
+  mkdirSync(temporaryDirectory, { recursive: true });
+  return spawnSync(process.execPath, [cliPath, ...args], {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      TMPDIR: temporaryDirectory,
+      npm_config_cache: join(temporaryDirectory, 'npm-cache'),
+      ...overrides,
+    },
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    timeout: 30_000,
+  });
+}
+
+test('plan emits inventory JSON without creating state', () => withScratch(scratch => {
+  const stateDirectory = join(scratch, 'state');
+  const result = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', stateDirectory,
+    'plan',
+    '--json',
+  ]);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    blockedSources: [],
+    packageCount: 0,
+    packages: [],
+    projectCount: 0,
+    publicBaseUrl: 'https://deps.example.net/mirror/',
+    schemaVersion: 1,
+    targets: ['linux-x64-gnu', 'mac-arm64'],
+  });
+  assert.throws(() => readdirSync(stateDirectory), { code: 'ENOENT' });
+}));
+
+test('import-lock writes a versioned inventory and plan observes it', () => withScratch(scratch => {
+  const stateDirectory = join(scratch, 'state');
+  const imported = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', stateDirectory,
+    'import-lock',
+    lockfilePath,
+    '--project', 'web',
+    '--target', 'linux-x64-gnu',
+  ]);
+
+  assert.equal(imported.status, 0, imported.stderr);
+  const inventory = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8'));
+  assert.equal(inventory.schemaVersion, 1);
+  assert.equal(inventory.projects[0].id, 'web');
+  assert.equal(inventory.projects[0].targets[0], 'linux-x64-gnu');
+
+  const planned = runCli(scratch, ['--config', configPath, '--state-dir', stateDirectory, 'plan', '--json']);
+  assert.equal(planned.status, 0, planned.stderr);
+  const expectedPackageCount = new Set(inventory.projects.flatMap(project => project.packages)
+    .filter(item => item.version !== null)
+    .map(item => `${item.name}@${item.version}`)).size;
+  assert.equal(JSON.parse(planned.stdout).packageCount, expectedPackageCount);
+}));
+
+test('import-lock honors and records the project package manager pin', () => withScratch(scratch => {
+  const projectDirectory = join(scratch, 'project');
+  mkdirSync(projectDirectory);
+  const projectLockPath = join(projectDirectory, 'package-lock.json');
+  writeFileSync(projectLockPath, readFileSync(lockfilePath));
+  writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web","packageManager":"npm@12.2.1"}\n');
+  const stateDirectory = join(scratch, 'state');
+
+  const result = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', stateDirectory,
+    'import-lock',
+    projectLockPath,
+    '--project',
+    'web',
+  ]);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Package manager pin: npm@12\.2\.1/);
+  const inventory = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8'));
+  assert.equal(inventory.projects[0].packageManagerPin, 'npm@12.2.1');
+
+  writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web","packageManager":"pnpm@12.15.0"}\n');
+  const mismatch = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', join(scratch, 'mismatch-state'),
+    'import-lock',
+    projectLockPath,
+    '--project',
+    'web',
+  ]);
+  assert.equal(mismatch.status, 2);
+  assert.match(mismatch.stderr, /does not match npm lockfile/);
+}));
+
+test('CLI maps usage, invalid input, and corrupt state to the specified exit codes', () => withScratch(scratch => {
+  const usage = runCli(scratch, ['plan', '--unknown']);
+  assert.equal(usage.status, 2);
+  assert.equal((usage.stderr.match(/mynpm:/g) ?? []).length, 1);
+
+  const invalidInput = runCli(scratch, ['--config', join(scratch, 'missing.json'), 'plan']);
+  assert.equal(invalidInput.status, 2);
+
+  const stateDirectory = join(scratch, 'state');
+  mkdirSync(stateDirectory);
+  writeFileSync(join(stateDirectory, 'inventory.json'), '{');
+  const corrupt = runCli(scratch, ['--config', configPath, '--state-dir', stateDirectory, 'plan']);
+  assert.equal(corrupt.status, 1);
+}));
+
+test('add requires exact root pins and the campaign-pinned package manager', () => withScratch(scratch => {
+  const invalid = runCli(scratch, [
+    '--config', configPath,
+    'add',
+    'sample-package@latest',
+    '--manager',
+    'npm',
+  ]);
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /requires an exact package pin/);
+
+  const fakeBin = join(scratch, 'bin');
+  mkdirSync(fakeBin);
+  const fakeNpm = join(fakeBin, 'npm');
+  writeFileSync(fakeNpm, '#!/bin/sh\nprintf "11.20.0\\n"\n');
+  chmodSync(fakeNpm, 0o755);
+  const stateDirectory = join(scratch, 'state');
+  const unavailable = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', stateDirectory,
+    'add',
+    'sample-package@1.2.3',
+    '--manager',
+    'npm',
+  ], { PATH: `${fakeBin}:${process.env.PATH}` });
+  assert.equal(unavailable.status, 1);
+  assert.match(unavailable.stderr, /npm 12\.2\.1 is required for add; found 11\.20\.0/);
+  assert.throws(() => readdirSync(stateDirectory), { code: 'ENOENT' });
+}));
+
+test('add strips caller auth and registry settings, resolves exact roots, and repeats without state changes', () => withScratch(scratch => {
+  const fakeBin = join(scratch, 'bin');
+  mkdirSync(fakeBin);
+  const fakeNpm = join(fakeBin, 'npm');
+  const fakeLock = join(scratch, 'package-lock.json');
+  writeFileSync(fakeLock, readFileSync(addLockfilePath));
+  writeFileSync(fakeNpm, [
+    '#!/bin/sh',
+    'if [ "$1" = "--version" ]; then printf "12.2.1\\n"; exit 0; fi',
+    'test "${NPM_TOKEN+x}" != x',
+    'test "${NODE_AUTH_TOKEN+x}" != x',
+    'test "$npm_config_registry" = "https://registry.npmjs.org/"',
+    `cp '${fakeLock}' package-lock.json`,
+    '',
+  ].join('\n'));
+  chmodSync(fakeNpm, 0o755);
+  const stateDirectory = join(scratch, 'state');
+  const arguments_ = [
+    '--config', configPath,
+    '--state-dir', stateDirectory,
+    'add',
+    'sample-package@1.2.3',
+    '--manager',
+    'npm',
+  ];
+  const environment = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    NPM_TOKEN: 'inherited-secret',
+    NODE_AUTH_TOKEN: 'inherited-secret',
+    npm_config_registry: 'https://registry.example.invalid/',
+  };
+
+  const added = runCli(scratch, arguments_, environment);
+  assert.equal(added.status, 0, added.stderr);
+  assert.match(added.stdout, /npm@12\.2\.1/);
+  const inventoryPath = join(stateDirectory, 'inventory.json');
+  const inventoryBytes = readFileSync(inventoryPath);
+  const inventory = JSON.parse(inventoryBytes);
+  assert.deepEqual(inventory.projects.map(project => project.targets[0]), ['linux-x64-gnu', 'mac-arm64']);
+  assert.ok(inventory.projects.every(project => project.packageManagerPin === 'npm@12.2.1'));
+  assert.ok(inventory.projects.every(project => project.packages.map(pkg => `${pkg.name}@${pkg.version}`).join(',') === 'sample-package@1.2.3,transitive@2.0.0'));
+
+  const repeated = runCli(scratch, arguments_, environment);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.deepEqual(readFileSync(inventoryPath), inventoryBytes);
+}));
+
+test('doctor reports external sources without changing the project', () => withScratch(scratch => {
+  const projectDirectory = join(scratch, 'project');
+  mkdirSync(projectDirectory);
+  const projectLockPath = join(projectDirectory, 'package-lock.json');
+  const lock = JSON.parse(readFileSync(lockfilePath, 'utf8'));
+  lock.packages['node_modules/private-host'] = {
+    version: '1.0.0',
+    resolved: 'https://192.168.4.5/npm/private-host/-/private-host-1.0.0.tgz',
+    integrity: 'sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+    hasInstallScript: true,
+  };
+  const lockBytes = Buffer.from(`${JSON.stringify(lock)}\n`);
+  writeFileSync(projectLockPath, lockBytes);
+  writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web","packageManager":"npm@12.2.1","scripts":{"preinstall":"echo pre","postinstall":"echo post"}}\n');
+
+  const result = runCli(scratch, ['--config', configPath, 'doctor', projectDirectory]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /third-party-download: external-tarball/);
+  assert.match(result.stdout, /local-source: workspace-link/);
+  assert.match(result.stdout, /git-source: git-source/);
+  assert.match(result.stdout, /private-host: private-host/);
+  assert.match(result.stdout, /install\/build hook: private-host/);
+  assert.match(result.stdout, /Root lifecycle scripts: preinstall, postinstall/);
+  assert.match(result.stdout, /@esbuild\/linux-x64.*native binary or build/);
+  assert.match(result.stdout, /--omit-lockfile-registry-resolved/);
+  assert.match(result.stdout, /replace-registry-host defaults to npmjs/);
+  assert.match(result.stdout, /Package manager pin: npm@12\.2\.1/);
+  assert.match(result.stdout, /copy/i);
+  assert.doesNotMatch(result.stdout, /secret/);
+  assert.deepEqual(readFileSync(projectLockPath), lockBytes);
+  assert.deepEqual(readdirSync(projectDirectory).sort(), ['package-lock.json', 'package.json']);
+}));
+
+test('doctor reports pnpm sources and build hooks without changing the project', { skip: !yamlAvailable }, () => withScratch(scratch => {
+  const projectDirectory = join(scratch, 'pnpm-project');
+  mkdirSync(projectDirectory);
+  const lockBytes = readFileSync(pnpmLockfilePath);
+  const manifestBytes = Buffer.from('{"name":"web","packageManager":"pnpm@12.15.0","scripts":{"prepare":"echo prepare"}}\n');
+  writeFileSync(join(projectDirectory, 'pnpm-lock.yaml'), lockBytes);
+  writeFileSync(join(projectDirectory, 'package.json'), manifestBytes);
+
+  const result = runCli(scratch, ['--config', configPath, 'doctor', projectDirectory]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Package manager pin: pnpm@12\.15\.0/);
+  assert.match(result.stdout, /private-host: private-download/);
+  assert.match(result.stdout, /Dependency install\/build hooks in lockfile: 1/);
+  assert.match(result.stdout, /install\/build hook: private-download@1\.0\.0/);
+  assert.match(result.stdout, /Root lifecycle scripts: prepare/);
+  assert.match(result.stdout, /pnpm install --lockfile-only --ignore-scripts/);
+  assert.deepEqual(readFileSync(join(projectDirectory, 'pnpm-lock.yaml')), lockBytes);
+  assert.deepEqual(readFileSync(join(projectDirectory, 'package.json')), manifestBytes);
+  assert.deepEqual(readdirSync(projectDirectory).sort(), ['package.json', 'pnpm-lock.yaml']);
+}));

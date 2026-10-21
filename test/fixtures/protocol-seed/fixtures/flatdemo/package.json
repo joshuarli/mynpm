@@ -1,0 +1,7 @@
+{
+  "name": "flatdemo",
+  "version": "1.2.3",
+  "main": "index.js",
+  "license": "MIT",
+  "description": "Small unscoped package for a static npm registry PoC"
+}

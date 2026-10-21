@@ -1,0 +1,8 @@
+{
+  "name": "@flatrepo/demo",
+  "version": "2.3.4",
+  "main": "index.js",
+  "license": "MIT",
+  "description": "Scoped package depending on another package in the static registry",
+  "dependencies": { "flatdemo": "1.2.3" }
+}

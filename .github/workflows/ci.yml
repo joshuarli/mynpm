@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      public_smoke:
+        description: Resolve and fetch the pinned public npm packages, then validate the local static site
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22.16.0
+          package-manager-cache: false
+      - name: Check pinned compatibility toolchain
+        run: |
+          test "$(node --version)" = "v22.16.0"
+          test "$(npm --version)" = "10.9.2"
+      - name: Prepare ignored scratch
+        run: |
+          if ! grep -qxF '.work/' .git/info/exclude; then
+            printf '\n.work/\n' >> .git/info/exclude
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/.work/tmp"
+      - name: Install locked parser dependency
+        env:
+          TMPDIR: ${{ github.workspace }}/.work/tmp
+          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run offline suite
+        env:
+          TMPDIR: ${{ github.workspace }}/.work/tmp
+          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
+        run: npm test
+
+  static-clients:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            client: npm
+          - runner: ubuntu-24.04
+            client: pnpm
+          - runner: macos-26
+            client: npm
+          - runner: macos-26
+            client: pnpm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Install pinned npm
+        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
+      - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
+        if: matrix.client == 'pnpm'
+        with:
+          version: 12.15.0
+          install: false
+      - name: Check pinned client and architecture
+        env:
+          CLIENT: ${{ matrix.client }}
+        run: |
+          test "$(node --version)" = "v24.22.0"
+          test "$(npm --version)" = "12.2.1"
+          if [ "$CLIENT" = pnpm ]; then test "$(pnpm --version)" = "12.15.0"; fi
+          if [ "$RUNNER_OS" = macOS ]; then test "$(uname -m)" = arm64; fi
+      - name: Prepare ignored scratch
+        run: |
+          if ! grep -qxF '.work/' .git/info/exclude; then
+            printf '\n.work/\n' >> .git/info/exclude
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/.work/tmp"
+      - name: Install locked parser dependency
+        env:
+          TMPDIR: ${{ github.workspace }}/.work/tmp
+          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Exercise pinned static clients
+        env:
+          TMPDIR: ${{ github.workspace }}/.work/tmp
+          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
+        run: node --test test/publish.test.mjs
+
+  public-smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.public_smoke == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Install pinned npm
+        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
+      - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
+        with:
+          version: 12.15.0
+          install: false
+      - name: Check pinned toolchain
+        run: |
+          test "$(node --version)" = "v24.22.0"
+          test "$(npm --version)" = "12.2.1"
+          test "$(pnpm --version)" = "12.15.0"
+      - name: Prepare ignored scratch
+        run: |
+          if ! grep -qxF '.work/' .git/info/exclude; then
+            printf '\n.work/\n' >> .git/info/exclude
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/.work/tmp"
+      - name: Install locked parser dependency
+        env:
+          TMPDIR: ${{ github.workspace }}/.work/tmp
+          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Resolve, fetch, verify, and validate the pinned public closure
+        env:
+          TMPDIR: ${{ github.workspace }}/.work/tmp
+          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
+        run: |
+          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state add typescript@5.9.3 esbuild@0.28.2 --manager npm
+          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state add typescript@5.9.3 esbuild@0.28.2 --manager pnpm
+          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state fetch
+          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state verify
+          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state publish --site-dir .work/smoke-site
+          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state validate --client npm
+          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state validate --client pnpm

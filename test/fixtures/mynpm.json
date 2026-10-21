@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "publicBaseUrl": "https://deps.example.net/mirror/",
+  "upstreamRegistry": "https://registry.npmjs.org/",
+  "targets": [
+    { "id": "mac-arm64", "os": "darwin", "cpu": "arm64", "node": "24.22.0" },
+    { "id": "linux-x64-gnu", "os": "linux", "cpu": "x64", "libc": "glibc", "node": "24.22.0" }
+  ],
+  "policy": {
+    "externalSources": "reject",
+    "remoteInstallScripts": "report",
+    "allowLegacySha1Only": false
+  }
+}

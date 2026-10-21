@@ -1,0 +1,27 @@
+{
+  "name": "flatdemo-consumer",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "flatdemo-consumer",
+      "version": "1.0.0",
+      "dependencies": {
+        "flatdemo": "1.2.3"
+      }
+    },
+    "node_modules/flatdemo": {
+      "version": "1.2.3",
+      "resolved": "https://registry.npmjs.org/flatdemo/-/flatdemo-1.2.3.tgz",
+      "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+    }
+  },
+  "dependencies": {
+    "flatdemo": {
+      "version": "1.2.3",
+      "resolved": "https://registry.npmjs.org/flatdemo/-/flatdemo-1.2.3.tgz",
+      "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+    }
+  }
+}
