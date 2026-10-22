@@ -117,6 +117,8 @@ function clientEnvironment(workspace, registry, cacheDirectory) {
     npm_config_update_notifier: 'false',
     npm_config_fetch_retries: '0',
     pnpm_config_store_dir: join(workspace, 'pnpm-store'),
+    pnpm_config_pm_on_fail: 'ignore',
+    pnpm_config_trust_lockfile: 'true',
   };
   return environment;
 }
@@ -314,6 +316,10 @@ async function assertSnapshotMatchesProject(project, target) {
   if ((manifest.packageManager ?? null) !== project.packageManagerPin) {
     fail('corrupt', `saved package.json pin no longer matches imported project ${project.id}`);
   }
+  const expectedPackageManagerPin = `${project.manager}@${managerVersions[project.manager]}`;
+  if (project.packageManagerPin !== null && project.packageManagerPin.replace(/\+sha512\..*$/, '') !== expectedPackageManagerPin) {
+    fail('input', `validation requires ${expectedPackageManagerPin}; project ${project.id} is pinned to ${project.packageManagerPin}`);
+  }
   const unsupported = project.packages.find(item => item.version !== null && supportsTarget(item.platform, target) && item.sourceKind !== 'registry' && item.sourceKind !== 'local');
   if (unsupported) fail('input', `validation rejects ${unsupported.sourceKind} source ${unsupported.name}@${unsupported.version}`);
 }
@@ -328,15 +334,20 @@ function localTarballUrl(registry, digest) {
   return new URL(`../tarballs/${digest}.tgz`, registry).href;
 }
 
+function unavailableTarballUrl(registry) {
+  return new URL('../tarballs/unavailable.tgz', registry).href;
+}
+
 function rewriteNpmLock(project, target, artifacts, registry) {
   const lock = JSON.parse(project.snapshot.lockfile);
   for (const item of project.packages) {
-    if (item.version === null || !supportsTarget(item.platform, target) || item.sourceKind === 'local') continue;
+    if (item.version === null || item.sourceKind === 'local') continue;
     if (item.sourceKind !== 'registry') fail('input', `validation cannot migrate ${item.sourceKind} source ${item.name}@${item.version}`);
-    const artifact = packageArtifact(project, item, artifacts);
     const entry = lock.packages?.[item.key];
     if (!entry || typeof entry !== 'object') fail('corrupt', `saved npm lockfile is missing ${item.key}`);
-    entry.resolved = localTarballUrl(registry, artifact.artifact.sha512);
+    entry.resolved = supportsTarget(item.platform, target)
+      ? localTarballUrl(registry, packageArtifact(project, item, artifacts).artifact.sha512)
+      : unavailableTarballUrl(registry);
   }
   return `${JSON.stringify(lock, null, 2)}\n`;
 }
@@ -347,21 +358,27 @@ async function rewritePnpmLock(project, target, artifacts, registry) {
   for (const document of values) {
     for (const [key, entry] of Object.entries(document.packages ?? {})) {
       const item = packages.get(key);
-      if (!item || item.version === null || !supportsTarget(item.platform, target) || item.sourceKind === 'local') continue;
-      if (item.sourceKind !== 'registry') fail('input', `validation cannot migrate ${item.sourceKind} source ${item.name}@${item.version}`);
-      const artifact = packageArtifact(project, item, artifacts);
-      entry.resolution.tarball = localTarballUrl(registry, artifact.artifact.sha512);
+      if (!item || item.version === null || item.sourceKind === 'local') continue;
+      if (item.sourceKind !== 'registry') {
+        if (supportsTarget(item.platform, target)) fail('input', `validation cannot migrate ${item.sourceKind} source ${item.name}@${item.version}`);
+        continue;
+      }
+      if (!entry.resolution || typeof entry.resolution !== 'object') fail('corrupt', `saved pnpm lockfile is missing package resolution for ${item.name}@${item.version}`);
+      entry.resolution.tarball = supportsTarget(item.platform, target)
+        ? localTarballUrl(registry, packageArtifact(project, item, artifacts).artifact.sha512)
+        : unavailableTarballUrl(registry);
     }
   }
-  return values.map(value => yaml.stringify(value).trimEnd()).join('\n---\n') + '\n';
+  const documentMarker = /^\s*---(?:\s|$)/.test(project.snapshot.lockfile) ? '---\n' : '';
+  return documentMarker + values.map(value => yaml.stringify(value).trimEnd()).join('\n---\n') + '\n';
 }
 
-async function assertMigrationPreservesGraph(project, target, migratedLock) {
+async function assertMigrationPreservesGraph(project, migratedLock) {
   if (project.manager === 'npm') {
     const original = JSON.parse(project.snapshot.lockfile);
     const migrated = JSON.parse(migratedLock);
     for (const item of project.packages) {
-      if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+      if (item.version === null || item.sourceKind !== 'registry') continue;
       const originalEntry = original.packages?.[item.key];
       const migratedEntry = migrated.packages?.[item.key];
       if (!originalEntry || !migratedEntry) fail('corrupt', `saved npm lockfile is missing ${item.key}`);
@@ -374,16 +391,18 @@ async function assertMigrationPreservesGraph(project, target, migratedLock) {
   const original = (await pnpmDocuments(project.snapshot.lockfile)).values;
   const migrated = (await pnpmDocuments(migratedLock)).values;
   for (const item of project.packages) {
-    if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+    if (item.version === null || item.sourceKind !== 'registry') continue;
     const originalEntries = original.map(document => document.packages?.[item.key]).filter(Boolean);
     const migratedEntries = migrated.map(document => document.packages?.[item.key]).filter(Boolean);
     if (originalEntries.length === 0 || migratedEntries.length === 0) fail('corrupt', `saved pnpm lockfile is missing ${item.name}@${item.version}`);
-    for (const entry of [...originalEntries, ...migratedEntries]) entry.resolution.tarball = 'mynpm-local-tarball';
+    for (const entry of [...originalEntries, ...migratedEntries]) {
+      entry.resolution.tarball = 'mynpm-local-tarball';
+    }
   }
   if (canonicalText(original) !== canonicalText(migrated)) fail('conflict', `registry migration changed the saved pnpm dependency graph for ${project.id}`);
 }
 
-async function lockGraph(manager, text, project, target) {
+async function lockGraph(manager, text, project) {
   if (manager === 'npm') {
     let lock;
     try {
@@ -392,7 +411,7 @@ async function lockGraph(manager, text, project, target) {
       throw new MynpmError('input', `npm package-lock.json is not valid JSON for ${project.id}`, { cause });
     }
     for (const item of project.packages) {
-      if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+      if (item.version === null || item.sourceKind !== 'registry') continue;
       const entry = lock.packages?.[item.key];
       if (!entry) fail('corrupt', `saved npm lockfile is missing ${item.key}`);
       entry.resolved = 'mynpm-local-tarball';
@@ -401,17 +420,19 @@ async function lockGraph(manager, text, project, target) {
   }
   const { values } = await pnpmDocuments(text);
   for (const item of project.packages) {
-    if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+    if (item.version === null || item.sourceKind !== 'registry') continue;
     const entries = values.map(document => document.packages?.[item.key]).filter(Boolean);
     if (entries.length === 0) fail('corrupt', `saved pnpm lockfile is missing ${item.key}`);
-    for (const entry of entries) entry.resolution.tarball = 'mynpm-local-tarball';
+    for (const entry of entries) {
+      entry.resolution.tarball = 'mynpm-local-tarball';
+    }
   }
   return values;
 }
 
-async function assertLockfileMatches(manager, expectedText, actualText, project, target) {
-  const expected = await lockGraph(manager, expectedText, project, target);
-  const actual = await lockGraph(manager, actualText, project, target);
+async function assertLockfileMatches(manager, expectedText, actualText, project) {
+  const expected = await lockGraph(manager, expectedText, project);
+  const actual = await lockGraph(manager, actualText, project);
   if (canonicalText(expected) !== canonicalText(actual)) fail('conflict', `${manager} changed the saved dependency graph for ${project.id}`);
 }
 
@@ -479,13 +500,13 @@ async function installProject({ client, project, target, workspace, registry, lo
   const migratedLock = client === 'npm'
     ? rewriteNpmLock(project, target, dependencies.artifacts, registry)
     : await rewritePnpmLock(project, target, dependencies.artifacts, registry);
-  await assertMigrationPreservesGraph(project, target, migratedLock);
+  await assertMigrationPreservesGraph(project, migratedLock);
   await writeProjectSnapshot(projectDirectory, project, migratedLock, lockfileName);
   const cacheDirectory = join(installWorkspace, 'cache');
   const environment = await createClientEnvironment(installWorkspace, registry, cacheDirectory);
   const run = dependencies.runProcess ?? runProcess;
   const args = client === 'npm'
-    ? ['ci', `--registry=${registry}`, `--cache=${cacheDirectory}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0']
+    ? ['ci', `--registry=${registry}`, `--cache=${cacheDirectory}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0', '--allow-remote=all']
     : ['install', '--frozen-lockfile', `--registry=${registry}`, `--store-dir=${join(installWorkspace, 'pnpm-store')}`, '--ignore-scripts'];
   await run(client, args, { cwd: projectDirectory, env: environment, signal: dependencies.signal, timeoutMs: clientTimeoutMilliseconds });
   let actualLock;
@@ -501,7 +522,7 @@ async function installProject({ client, project, target, workspace, registry, lo
     targetIds: [target.id],
     snapshot: null,
   });
-  await assertLockfileMatches(client, migratedLock, actualLock, project, target);
+  await assertLockfileMatches(client, migratedLock, actualLock, project);
   const selection = packageSelection(actualProject, target, dependencies.artifacts, { allowLocalHost: true, localOrigin });
   await assertProjectFilesUnchanged(projectDirectory, project, lockfileName);
   const roots = project.roots.filter(root => root.importer === '.');

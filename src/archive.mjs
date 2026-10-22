@@ -20,7 +20,8 @@ function parseListingLine(line) {
   const type = fields[0][0];
   const size = Number(fields.at(-1));
   if (!Number.isSafeInteger(size) || size < 0) invalid('package archive contains an invalid entry size');
-  const path = line.slice(date.index + date[0].length);
+  const reportedPath = line.slice(date.index + date[0].length);
+  const path = type === 'l' ? reportedPath.replace(/ -> .*$/, '') : reportedPath;
   if (path.length === 0 || path !== path.trim() || /[\\"'\u0000-\u001f\u007f]/.test(path)) {
     invalid('package archive contains an unsupported entry path');
   }

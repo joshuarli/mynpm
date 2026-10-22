@@ -100,7 +100,7 @@ jobs:
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
           npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
-        run: node --test test/publish.test.mjs
+        run: node --test test/publish.test.mjs test/validate.test.mjs
 
   public-smoke:
     if: github.event_name == 'workflow_dispatch' && inputs.public_smoke == true

@@ -393,8 +393,10 @@ test('published root and /mirror/ static URLs serve installable packages and imm
     npm_config_globalconfig: globalConfig,
     npm_config_update_notifier: 'false',
     npm_config_fund: 'false',
+    pnpm_config_pm_on_fail: 'ignore',
   };
   const npmVersion = await runProcess('npm', ['--version'], { cwd: directory, env, timeoutMs: 30_000 });
+  const remotePermission = npmVersion.stdout.trim().startsWith('12.') ? ['--allow-remote=all'] : [];
   const prefixPublish = await publishSite(publishOptions(directory, stateDirectory, siteDirectory), { renderBaseUrl: serverBase });
   assert.equal(prefixPublish.packageCount, 2);
   const oldPackumentUrl = `${serverBase}current/flatdemo`;
@@ -413,7 +415,7 @@ test('published root and /mirror/ static URLs serve installable packages and imm
   mkdirSync(prefixProject);
   writeFileSync(join(prefixProject, 'package.json'), '{"name":"consumer-prefix","version":"1.0.0","private":true}\n');
   const prefixCache = join(directory, 'prefix-cache');
-  await runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${serverBase}current/`, `--cache=${prefixCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
+  await runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${serverBase}current/`, `--cache=${prefixCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0', ...remotePermission], {
     cwd: prefixProject,
     env: { ...env, npm_config_cache: prefixCache },
     timeoutMs: 240_000,
@@ -447,7 +449,7 @@ test('published root and /mirror/ static URLs serve installable packages and imm
   mkdirSync(rootProject);
   writeFileSync(join(rootProject, 'package.json'), '{"name":"consumer-root","version":"1.0.0","private":true}\n');
   const rootCache = join(directory, 'root-cache');
-  await runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${rootBase}current/`, `--cache=${rootCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
+  await runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${rootBase}current/`, `--cache=${rootCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0', ...remotePermission], {
     cwd: rootProject,
     env: { ...env, npm_config_cache: rootCache },
     timeoutMs: 240_000,
@@ -462,7 +464,7 @@ test('published root and /mirror/ static URLs serve installable packages and imm
     mkdirSync(rootPnpmProject);
     await installWithPnpm(rootPnpmProject, `${rootBase}current/`, join(directory, 'root-pnpm'), env);
   }
-  await runProcess('npm', ['ci', `--registry=${rootBase}current/`, `--cache=${join(directory, 'root-ci-cache')}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
+  await runProcess('npm', ['ci', `--registry=${rootBase}current/`, `--cache=${join(directory, 'root-ci-cache')}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0', ...remotePermission], {
     cwd: rootProject,
     env: { ...env, npm_config_cache: join(directory, 'root-ci-cache') },
     timeoutMs: 240_000,

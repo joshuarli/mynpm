@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.mjs';
 import { createEmptyInventory, mergeProject, recordVerifiedArtifact } from '../src/inventory.mjs';
 import { parseNpmLock } from '../src/lock-npm.mjs';
+import { parsePnpmLock } from '../src/lock-pnpm.mjs';
 import { saveInventory } from '../src/inventory-store.mjs';
 import { managerVersions } from '../src/resolve.mjs';
 import { validateInventory } from '../src/validate.mjs';
@@ -49,7 +50,7 @@ test('validate fails before package acquisition when the pinned Node or package-
           error => error.category === 'operation' && error.message.includes(`npm ${managerVersions.npm} is required`),
         );
       } else {
-        await assert.rejects(validateInventory({ client: 'npm', stateDirectory, config }), /no verified artifact/);
+        await assert.rejects(validateInventory({ client: 'npm', stateDirectory, config }), /requires an imported package.json snapshot/);
       }
     }
   } finally {
@@ -112,6 +113,88 @@ async function savedNpmProject(directory) {
   return { stateDirectory, config: testConfig, bytes, lock, lockText, manifestText, target };
 }
 
+async function savedPnpmWorkspace(directory) {
+  const target = currentTarget();
+  const bytes = readFileSync(new URL('./fixtures/tarballs/flatdemo-1.2.3.tgz', import.meta.url));
+  const sha512 = createHash('sha512').update(bytes).digest('hex');
+  const shasum = createHash('sha1').update(bytes).digest('hex');
+  const integrity = `sha512-${Buffer.from(sha512, 'hex').toString('base64')}`;
+  const sourceUrl = 'https://registry.npmjs.org/flatdemo/-/flatdemo-1.2.3.tgz';
+  const manifestText = `${JSON.stringify({
+    name: 'original-workspace',
+    version: '1.0.0',
+    private: true,
+    packageManager: 'pnpm@12.15.0',
+  }, null, 2)}\n`;
+  const appManifest = `${JSON.stringify({
+    name: 'workspace-app',
+    version: '1.0.0',
+    private: true,
+    dependencies: { flatdemo: '1.2.3' },
+  }, null, 2)}\n`;
+  const workspaceManifest = 'packages:\n  - apps/*\n';
+  const lockText = `---
+lockfileVersion: '9.0'
+importers:
+  .:
+    configDependencies: {}
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.15.0
+        version: 12.15.0
+packages: {}
+snapshots: {}
+---
+lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+importers:
+  .: {}
+  apps/web:
+    dependencies:
+      flatdemo:
+        specifier: 1.2.3
+        version: 1.2.3
+packages:
+  flatdemo@1.2.3:
+    resolution:
+      integrity: ${integrity}
+snapshots:
+  flatdemo@1.2.3: {}
+`;
+  const project = await parsePnpmLock(lockText, {
+    projectId: 'original-workspace',
+    packageManagerPin: 'pnpm@12.15.0',
+    lockfilePath: 'pnpm-lock.yaml',
+    targetIds: [target.id],
+    snapshot: {
+      manifest: manifestText,
+      lockfile: lockText,
+      workspaceFiles: [
+        { path: 'apps/web/package.json', contents: appManifest },
+        { path: 'pnpm-workspace.yaml', contents: workspaceManifest },
+      ],
+    },
+  });
+  let inventory = mergeProject(createEmptyInventory(), project);
+  inventory = recordVerifiedArtifact(inventory, {
+    name: 'flatdemo',
+    version: '1.2.3',
+    packument: { name: 'flatdemo', 'dist-tags': { latest: '1.2.3' } },
+    metadata: { name: 'flatdemo', version: '1.2.3', dist: { tarball: sourceUrl, integrity, shasum } },
+    artifact: { sha512, integrity, shasum, sourceUrl, legacySha1Only: false },
+  });
+  const stateDirectory = join(directory, 'state');
+  const objectDirectory = join(stateDirectory, 'objects', 'sha512');
+  mkdirSync(objectDirectory, { recursive: true });
+  writeFileSync(join(objectDirectory, `${sha512}.tgz`), bytes);
+  await saveInventory(stateDirectory, inventory);
+  const testConfig = structuredClone(config);
+  testConfig.targets.find(item => item.id === target.id).node = process.versions.node;
+  return { stateDirectory, config: testConfig, target };
+}
+
 function fakeNpm(restore, afterInstall = async () => {}) {
   return async (command, args, options) => {
     if (args[0] === '--version') return { stdout: '12.2.1\n', stderr: '' };
@@ -147,6 +230,39 @@ test('validate restores the original npm manifest and lock graph through local t
     assert.equal(result.projectCount, 1);
     assert.equal(result.packageCount, 1);
     assert.ok(result.requestCount >= 4);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('validate restores the original npm project with the pinned client and local tarballs', {
+  skip: process.version !== 'v24.22.0' || spawnSync('npm', ['--version'], { encoding: 'utf8' }).stdout?.trim() !== '12.2.1',
+}, async () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const directory = mkdtempSync(join(scratchRoot, 'validate-npm-client-'));
+  try {
+    const restore = await savedNpmProject(directory);
+    const result = await validateInventory({ client: 'npm', stateDirectory: restore.stateDirectory, config: restore.config });
+    assert.equal(result.projectCount, 1);
+    assert.equal(result.packageCount, 1);
+    assert.ok(result.requestCount >= 2);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('validate restores a pnpm workspace and frozen lock graph through local tarballs', {
+  skip: process.version !== 'v24.22.0' || spawnSync('pnpm', ['--version'], { encoding: 'utf8' }).stdout.trim() !== '12.15.0',
+}, async () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const directory = mkdtempSync(join(scratchRoot, 'validate-pnpm-workspace-'));
+  try {
+    const restore = await savedPnpmWorkspace(directory);
+    const result = await validateInventory({ client: 'pnpm', stateDirectory: restore.stateDirectory, config: restore.config });
+    assert.equal(result.projectCount, 1);
+    assert.equal(result.packageCount, 1);
+    assert.equal(result.rootCount, 1);
+    assert.ok(result.requestCount >= 2);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -193,6 +309,33 @@ test('validate refuses to rebuild a project when its imported manifest snapshot 
       }),
       error => error.category === 'input' && error.message.includes('requires an imported package.json snapshot'),
     );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('validate rejects an imported project pinned to another package-manager version', async () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const directory = mkdtempSync(join(scratchRoot, 'validate-manager-pin-'));
+  try {
+    const restore = await savedNpmProject(directory);
+    const inventoryPath = join(restore.stateDirectory, 'inventory.json');
+    const inventory = JSON.parse(readFileSync(inventoryPath, 'utf8'));
+    inventory.projects[0].packageManagerPin = 'npm@10.9.2';
+    inventory.projects[0].snapshot.manifest = inventory.projects[0].snapshot.manifest.replace('npm@12.2.1', 'npm@10.9.2');
+    await saveInventory(restore.stateDirectory, inventory);
+    const commands = [];
+
+    await assert.rejects(
+      validateInventory({ client: 'npm', stateDirectory: restore.stateDirectory, config: restore.config }, {
+        runProcess: async (command, args) => {
+          commands.push([command, args[0]]);
+          return { stdout: '12.2.1\n', stderr: '' };
+        },
+      }),
+      error => error.category === 'input' && error.message.includes('validation requires npm@12.2.1'),
+    );
+    assert.deepEqual(commands, [['npm', '--version']]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

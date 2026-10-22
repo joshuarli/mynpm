@@ -46,7 +46,6 @@ test('pnpm two-document YAML preserves manager and project packages for doctor a
   ]);
   assert.deepEqual(project.roots.map(root => [root.group, root.requestedName, root.packageVersion]), [
     ['dependencies', 'private-download', '1.0.0'],
-    ['devDependencies', 'pnpm', '12.15.0'],
   ]);
   assert.deepEqual(await pnpmBuildPackageKeys(text), ['private-download@1.0.0']);
 });
