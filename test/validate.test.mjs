@@ -252,7 +252,7 @@ test('validate restores the original npm project with the pinned client and loca
 });
 
 test('validate restores a pnpm workspace and frozen lock graph through local tarballs', {
-  skip: process.version !== 'v24.22.0' || spawnSync('pnpm', ['--version'], { encoding: 'utf8' }).stdout.trim() !== '12.15.0',
+  skip: process.version !== 'v24.22.0' || spawnSync('pnpm', ['--version'], { encoding: 'utf8' }).stdout?.trim() !== '12.15.0',
 }, async () => {
   mkdirSync(scratchRoot, { recursive: true });
   const directory = mkdtempSync(join(scratchRoot, 'validate-pnpm-workspace-'));
