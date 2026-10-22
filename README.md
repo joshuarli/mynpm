@@ -1,19 +1,21 @@
 # mynpm
 
-`mynpm` builds a curated, static npm archive from exact package versions and imported lockfiles. It verifies upstream tarballs, stores them by SHA-512, renders full npm packuments, and publishes immutable generations to a local directory. It does not run package lifecycle scripts during resolution, acquisition, or validation.
+`mynpm` creates a static npm archive from exact package versions and imported lockfiles. It verifies each upstream tarball, stores it by SHA-512, renders npm packuments, and publishes immutable generations. It does not run package lifecycle scripts during resolution, acquisition, or validation.
 
-The generated site is a set of static files. Serve the directory with a static HTTP server that supports encoded scoped paths such as `current/@types%2fnode`, returns JSON files as `application/json`, and serves tarballs as binary files. Metadata and tarballs use absolute URLs on the same origin. A production deployment is outside this tool and this repository's CI.
+The generated site contains static files. Serve it from an HTTP server that follows the `current` generation link. The server must support encoded scoped paths such as `current/@types%2fnode`. It must return packuments as `application/json` and `current/tarballs/` files as binary. Packuments point to content-addressed tarballs under `current/`, so npm 12 accepts them with its default remote-fetch policy. The canonical SHA-512 tarballs remain in `tarballs/` across generations. Metadata and tarball URLs use the same origin. This repository does not deploy the site.
 
 ## Requirements
 
 - Node.js 22.13 or newer to run the CLI.
 - npm 12.2.1 or pnpm 12.15.0 with Node.js 24.22.0 for `add` and `validate`.
 
-Install the one locked runtime dependency without running package scripts:
+Install the locked dependencies without running package scripts:
 
 ```sh
-npm ci --ignore-scripts --no-audit --no-fund
+pnpm install --frozen-lockfile --ignore-scripts
 ```
+
+Run `pnpm check` to type-check the CLI with TypeScript 7, lint the source and tests, and run the test suite.
 
 ## Configuration
 
@@ -27,14 +29,16 @@ The default targets are macOS arm64 and Linux x64 glibc. Additional supported ta
 mkdir -p .work/tmp
 export TMPDIR="$PWD/.work/tmp"
 
-node src/cli.mjs --config mynpm.json --state-dir .work/state \
+mynpm() { node --experimental-strip-types src/cli.ts "$@"; }
+
+mynpm --config mynpm.json --state-dir .work/state \
   import-lock ../app/package-lock.json --project app
-node src/cli.mjs --config mynpm.json --state-dir .work/state \
+mynpm --config mynpm.json --state-dir .work/state \
   add typescript@5.9.3 esbuild@0.28.2 --manager npm
-node src/cli.mjs --config mynpm.json --state-dir .work/state plan
-node src/cli.mjs --config mynpm.json --state-dir .work/state fetch
-node src/cli.mjs --config mynpm.json --state-dir .work/state verify
-node src/cli.mjs --config mynpm.json --state-dir .work/state \
+mynpm --config mynpm.json --state-dir .work/state plan
+mynpm --config mynpm.json --state-dir .work/state fetch
+mynpm --config mynpm.json --state-dir .work/state verify
+mynpm --config mynpm.json --state-dir .work/state \
   publish --site-dir .work/site
 ```
 
@@ -49,8 +53,8 @@ The hard limits are 64 MiB per metadata response, 1 GiB per compressed tarball, 
 Run the pinned client validation against imported npm or pnpm projects for the current configured target:
 
 ```sh
-node src/cli.mjs --config mynpm.json --state-dir .work/state validate --client npm
-node src/cli.mjs --config mynpm.json --state-dir .work/state validate --client pnpm
+node --experimental-strip-types src/cli.ts --config mynpm.json --state-dir .work/state validate --client npm
+node --experimental-strip-types src/cli.ts --config mynpm.json --state-dir .work/state validate --client pnpm
 ```
 
 Validation restores the saved manifest, lockfile, and workspace files in a temporary copy. It directs registry tarball requests to the local archive, then runs `npm ci` or `pnpm install --frozen-lockfile` with scripts disabled and fresh caches. It compares the complete resulting lockfile graph and package/version/integrity selections. It checks both `/` and `/mirror/`, keeps package-manager requests on the loopback site, and runs TypeScript or esbuild when directly selected. It does not write to the original project.

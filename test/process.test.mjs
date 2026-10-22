@@ -1,35 +1,34 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { MynpmError } from '../src/errors.mjs';
-import { runProcess } from '../src/process.mjs';
+import { it } from '@effect/vitest';
+import { Deferred, Effect, Fiber } from 'effect';
+import { MynpmError } from '../src/errors.ts';
+import { runProcess } from '../src/process.ts';
 
-test('process output rejection terminates the child and preserves the validation error', async () => {
+it.effect('process output rejection terminates the child and preserves the validation error', () => Effect.gen(function*() {
   const failure = new MynpmError('input', 'archive entry rejected');
 
-  await assert.rejects(
-    runProcess(process.execPath, ['-e', 'process.stdout.write("entry\\n"); setInterval(() => {}, 1000)'], {
+  const outcome = yield* Effect.result(runProcess(process.execPath, ['-e', 'process.stdout.write("entry\\n"); setInterval(() => {}, 1000)'], {
       cwd: process.cwd(),
       env: process.env,
       timeoutMs: 10_000,
       onStdout() {
         throw failure;
       },
-    }),
-    error => error === failure,
-  );
-});
+    }));
+  assert.equal(outcome._tag, 'Failure');
+  if (outcome._tag === 'Failure') assert.equal(outcome.failure, failure);
+}));
 
-test('an already aborted signal terminates a process as soon as it starts', async () => {
-  const controller = new AbortController();
-  controller.abort();
-
-  await assert.rejects(
-    runProcess(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+it.effect('interrupting a process effect terminates the child', () => Effect.gen(function*() {
+  const started = yield* Deferred.make();
+  const fiber = yield* Effect.forkChild(runProcess(process.execPath, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'], {
       cwd: process.cwd(),
       env: process.env,
-      signal: controller.signal,
       timeoutMs: 10_000,
-    }),
-    error => error.category === 'cancelled',
-  );
-});
+      onStdout: () => Effect.runSync(Deferred.succeed(started, undefined)),
+    }));
+  yield* Deferred.await(started);
+  yield* Fiber.interrupt(fiber);
+  const exit = yield* Fiber.await(fiber);
+  assert.equal(exit._tag, 'Failure');
+}));

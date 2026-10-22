@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { parseConfig } from '../src/config.mjs';
+import { test } from 'vitest';
+import { parseConfig } from '../src/config.ts';
 
 const baseConfig = {
   schemaVersion: 1,

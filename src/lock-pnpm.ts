@@ -1,41 +1,53 @@
-import { MynpmError } from './errors.mjs';
+import type { DependencyGroup, PackageFlags, PackageManager, PackageRecord, ProjectRecord, ProjectSnapshot, RootDependency } from './inventory.ts';
+import { errorCode, MynpmError } from './errors.ts';
+import { Effect } from 'effect';
+
+type JsonRecord = Record<string, unknown>;
+type PackageIdentity = { name: string; version: string | null; reference: string };
+type ParsePnpmLockOptions = {
+  projectId: string;
+  packageManagerPin?: string | null;
+  lockfilePath: string;
+  targetIds: readonly string[];
+  snapshot?: ProjectSnapshot | null;
+};
 
 const packageNamePattern = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 const versionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const integrityLengths = new Map([['sha1', 20], ['sha256', 32], ['sha384', 48], ['sha512', 64]]);
-const dependencyGroups = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+const dependencyGroups: readonly DependencyGroup[] = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 
-function invalid(message) {
+function invalid(message: string): never {
   throw new MynpmError('input', message);
 }
 
-function isRecord(value) {
+function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function requireRecord(value, label) {
+function requireRecord(value: unknown, label: string): JsonRecord {
   if (!isRecord(value)) invalid(`${label} must be an object`);
   return value;
 }
 
-function requireText(value, label) {
+function requireText(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
     invalid(`${label} must be a non-empty string`);
   }
   return value;
 }
 
-function requirePackageName(value, label) {
-  requireText(value, label);
-  if (!packageNamePattern.test(value)) invalid(`${label} is not a valid package name`);
-  return value;
+function requirePackageName(value: unknown, label: string): string {
+  const name = requireText(value, label);
+  if (!packageNamePattern.test(name)) invalid(`${label} is not a valid package name`);
+  return name;
 }
 
-function parseIntegrity(value, label) {
+function parseIntegrity(value: unknown, label: string): string | null {
   if (value === undefined) return null;
-  requireText(value, label);
-  const tokens = value.split(/\s+/);
-  const claims = new Map();
+  const integrity = requireText(value, label);
+  const tokens = integrity.split(/\s+/);
+  const claims = new Map<string, string>();
   for (const token of tokens) {
     const [claim] = token.split('?', 1);
     const separator = claim.indexOf('-');
@@ -49,10 +61,10 @@ function parseIntegrity(value, label) {
     if (claims.has(algorithm) && claims.get(algorithm) !== hex) invalid(`${label} contains conflicting ${algorithm} claims`);
     claims.set(algorithm, hex);
   }
-  return value;
+  return integrity;
 }
 
-function packageIdentity(key, label) {
+function packageIdentity(key: string, label: string): PackageIdentity {
   requireText(key, label);
   const normalizedKey = key.startsWith('/') ? key.slice(1) : key;
   const slash = normalizedKey.startsWith('@') ? normalizedKey.indexOf('/') : -1;
@@ -64,12 +76,12 @@ function packageIdentity(key, label) {
   return { name, version: versionPattern.test(version) ? version : null, reference };
 }
 
-function sanitizeUrl(value, label) {
+function sanitizeUrl(value: unknown, label: string): { url: string | null; hadCredentials: boolean } {
   if (value === undefined) return { url: null, hadCredentials: false };
-  requireText(value, label);
-  let url;
+  const source = requireText(value, label);
+  let url: URL;
   try {
-    url = new URL(value);
+    url = new URL(source);
   } catch (cause) {
     throw new MynpmError('input', `${label} is not a valid absolute URL`, { cause });
   }
@@ -83,13 +95,13 @@ function sanitizeUrl(value, label) {
   return { url: url.href, hadCredentials };
 }
 
-function sourceKind(resolution, reference, url, hadCredentials) {
+function sourceKind(resolution: JsonRecord, reference: string, url: string | null, hadCredentials: boolean): PackageRecord['sourceKind'] {
   if (resolution.type === 'directory' || typeof resolution.directory === 'string' || /^(?:file|link|workspace):/i.test(reference)) return 'local';
   if (hadCredentials) return 'external-url';
   if (resolution.type === 'git' || typeof resolution.commit === 'string' || /^(?:git\+|git:|github:|ssh\+git:)/i.test(reference)) return 'git';
   if (url === null) return 'registry';
   if (url.startsWith('file:')) return 'local';
-  let parsed;
+  let parsed: URL;
   try {
     parsed = new URL(url);
   } catch (cause) {
@@ -98,42 +110,40 @@ function sourceKind(resolution, reference, url, hadCredentials) {
   return parsed.protocol === 'https:' && parsed.hostname === 'registry.npmjs.org' ? 'registry' : 'external-url';
 }
 
-function parsePlatform(entry, label) {
-  const platform = {};
-  for (const field of ['os', 'cpu', 'libc']) {
+function parsePlatform(entry: JsonRecord, label: string): PackageRecord['platform'] {
+  const platform: PackageRecord['platform'] = { os: null, cpu: null, libc: null };
+  for (const field of ['os', 'cpu', 'libc'] as const) {
     const value = entry[field];
-    if (value === undefined) {
-      platform[field] = null;
-      continue;
-    }
-    const values = Array.isArray(value) ? value : [value];
+    if (value === undefined) continue;
+    const values: unknown[] = Array.isArray(value) ? value : [value];
     if (values.length === 0 || values.some(item => typeof item !== 'string' || item.length === 0)) {
       invalid(`${label}.${field} must be a string or non-empty string array`);
     }
-    platform[field] = [...new Set(values)].sort();
+    const strings = values.filter((item): item is string => typeof item === 'string');
+    platform[field] = [...new Set(strings)].sort();
   }
   return platform;
 }
 
-function parseFlags(entry, label) {
-  const flags = {};
-  for (const field of ['dev', 'optional', 'peer', 'peerOptional']) {
+function parseFlags(entry: JsonRecord, label: string): PackageFlags {
+  const flags: PackageFlags = { dev: false, optional: false, peer: false, peerOptional: false, link: false };
+  for (const field of ['dev', 'optional', 'peer', 'peerOptional'] as const) {
     const value = entry[field];
     if (value !== undefined && typeof value !== 'boolean') invalid(`${label}.${field} must be a boolean`);
-    flags[field] = value ?? false;
+    flags[field] = value === true;
   }
-  flags.link = entry.resolution?.type === 'directory';
+  flags.link = isRecord(entry.resolution) && entry.resolution.type === 'directory';
   return flags;
 }
 
-function normalizeTargets(targetIds) {
+function normalizeTargets(targetIds: unknown): string[] {
   if (!Array.isArray(targetIds) || targetIds.length === 0) invalid('at least one target ID is required for pnpm lockfile import');
-  const targets = targetIds.map((id, index) => requireText(id, `targetIds[${index}]`));
+  const targets = targetIds.map((id: unknown, index: number) => requireText(id, `targetIds[${index}]`));
   if (new Set(targets).size !== targets.length) invalid('target IDs must be unique');
   return targets.sort();
 }
 
-function normalizeImporterPath(value, label) {
+function normalizeImporterPath(value: unknown, label: string): string {
   const importerPath = requireText(value, label);
   if (importerPath !== '.' && (importerPath.startsWith('/') || importerPath.includes('\\') || importerPath.split('/').some(part => part === '' || part === '.' || part === '..'))) {
     invalid(`${label} must be a safe project-relative path`);
@@ -141,7 +151,7 @@ function normalizeImporterPath(value, label) {
   return importerPath;
 }
 
-function lockfileDocuments(values) {
+function lockfileDocuments(values: unknown): JsonRecord[] {
   if (!Array.isArray(values) || values.length === 0) invalid('pnpm lockfile must contain at least one YAML document');
   const documents = values.map((value, index) => requireRecord(value, `pnpm lockfile document ${index + 1}`));
   const version = documents[0].lockfileVersion;
@@ -155,18 +165,18 @@ function lockfileDocuments(values) {
   return documents;
 }
 
-function canonicalValue(value) {
+function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
   if (!isRecord(value)) return value;
   return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalValue(value[key])]));
 }
 
-function snapshotReference(key) {
+function snapshotReference(key: string): string {
   requireText(key, 'pnpm snapshot key');
   return (key.startsWith('/') ? key.slice(1) : key).split('(', 1)[0];
 }
 
-function packageReferenceMatches(reference, requestedName, packageRecord) {
+function packageReferenceMatches(reference: string, requestedName: string, packageRecord: PackageRecord): boolean {
   const packageKey = packageRecord.key.startsWith('/') ? packageRecord.key.slice(1) : packageRecord.key;
   const candidate = reference.startsWith('npm:') ? reference.slice(4) : reference;
   if (candidate === packageKey || candidate === `/${packageKey}`) return true;
@@ -183,16 +193,17 @@ function packageReferenceMatches(reference, requestedName, packageRecord) {
   return candidate === identity.version && identity.name === requestedName;
 }
 
-function parsePackageEntry(key, entryValue, targets) {
+function parsePackageEntry(key: string, entryValue: unknown, targets: string[]): PackageRecord {
   const label = `pnpm lockfile packages[${JSON.stringify(key)}]`;
   const identity = packageIdentity(key, label);
   const entry = requireRecord(entryValue, label);
   const resolution = requireRecord(entry.resolution, `${label}.resolution`);
-  if (resolution.revision !== undefined && (!Number.isInteger(resolution.revision) || resolution.revision < 0)) {
+  const revision = resolution.revision;
+  if (revision !== undefined && (typeof revision !== 'number' || !Number.isInteger(revision) || revision < 0)) {
     invalid(`${label}.resolution.revision must be a non-negative integer`);
   }
-  if (resolution.revision !== undefined && resolution.revision !== 0) {
-    invalid(`${label} uses unsupported resolution revision ${resolution.revision}`);
+  if (revision !== undefined && revision !== 0) {
+    invalid(`${label} uses unsupported resolution revision ${String(revision)}`);
   }
   const integrity = parseIntegrity(resolution.integrity, `${label}.resolution.integrity`);
   const { url, hadCredentials } = sanitizeUrl(resolution.tarball, `${label}.resolution.tarball`);
@@ -216,26 +227,27 @@ function parsePackageEntry(key, entryValue, targets) {
   };
 }
 
-function importerRoots(document, packageEntries, importerLabel) {
-  const roots = [];
-  const importers = document.importers ?? {};
-  requireRecord(importers, `${importerLabel}.importers`);
+function importerRoots(document: JsonRecord, packageEntries: Map<string, PackageRecord>, importerLabel: string): RootDependency[] {
+  const roots: RootDependency[] = [];
+  const importers = requireRecord(document.importers ?? {}, `${importerLabel}.importers`);
   for (const [importerPath, importerValue] of Object.entries(importers)) {
     normalizeImporterPath(importerPath, `${importerLabel}.importers path`);
     const importer = requireRecord(importerValue, `${importerLabel}.importers[${JSON.stringify(importerPath)}]`);
     for (const group of dependencyGroups) {
       const dependencies = importer[group];
       if (dependencies === undefined) continue;
-      requireRecord(dependencies, `${importerLabel}.importers[${JSON.stringify(importerPath)}].${group}`);
-      for (const [requestedName, entryValue] of Object.entries(dependencies)) {
+      const dependencyRecords = requireRecord(dependencies, `${importerLabel}.importers[${JSON.stringify(importerPath)}].${group}`);
+      for (const [requestedName, entryValue] of Object.entries(dependencyRecords)) {
         requirePackageName(requestedName, `${importerLabel}.importers dependency name`);
-        const dependency = typeof entryValue === 'string' ? { specifier: entryValue, version: entryValue } : requireRecord(entryValue, `${importerLabel}.importers dependency`);
+        const dependency = typeof entryValue === 'string'
+          ? { specifier: entryValue, version: entryValue }
+          : requireRecord(entryValue, `${importerLabel}.importers dependency`);
         const specifier = requireText(dependency.specifier, `${importerLabel}.importers dependency specifier`);
         const reference = requireText(dependency.version, `${importerLabel}.importers dependency version`);
         const match = [...packageEntries.values()].find(pkg => packageReferenceMatches(reference, requestedName, pkg));
         let packageName = requestedName;
-        let packageVersion = null;
-        let packageKey = null;
+        let packageVersion: string | null = null;
+        let packageKey: string | null = null;
         if (match) {
           packageName = match.name;
           packageVersion = match.version;
@@ -247,8 +259,8 @@ function importerRoots(document, packageEntries, importerLabel) {
           const separator = target.startsWith('@') ? target.indexOf('@', target.indexOf('/') + 1) : target.indexOf('@');
           if (separator > 0) {
             packageName = requirePackageName(target.slice(0, separator), `${importerLabel} dependency target`);
-            packageVersion = target.slice(separator + 1).split('(', 1)[0];
-            if (!versionPattern.test(packageVersion)) packageVersion = null;
+            const targetVersion = target.slice(separator + 1).split('(', 1)[0];
+            packageVersion = versionPattern.test(targetVersion) ? targetVersion : null;
           } else if (versionPattern.test(target)) {
             packageVersion = target;
           }
@@ -260,16 +272,15 @@ function importerRoots(document, packageEntries, importerLabel) {
   return roots;
 }
 
-function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockfilePath, targetIds, snapshot = null }) {
+function parsePnpmDocuments(values: unknown, { projectId, packageManagerPin = null, lockfilePath, targetIds, snapshot = null }: ParsePnpmLockOptions): ProjectRecord {
   const documents = lockfileDocuments(values);
   const targets = normalizeTargets(targetIds);
-  const packagesByKey = new Map();
-  const snapshotKeys = new Set();
-  const importerPaths = new Set();
-  const roots = [];
+  const packagesByKey = new Map<string, PackageRecord>();
+  const snapshotKeys = new Set<string>();
+  const importerPaths = new Set<string>();
+  const roots: RootDependency[] = [];
   for (const [index, document] of documents.entries()) {
-    const documentPackages = document.packages ?? {};
-    requireRecord(documentPackages, `pnpm lockfile document ${index + 1}.packages`);
+    const documentPackages = requireRecord(document.packages ?? {}, `pnpm lockfile document ${index + 1}.packages`);
     for (const [key, entry] of Object.entries(documentPackages)) {
       const parsed = parsePackageEntry(key, entry, targets);
       const prior = packagesByKey.get(key);
@@ -278,17 +289,15 @@ function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockf
       }
       packagesByKey.set(key, parsed);
     }
-    const snapshots = document.snapshots ?? {};
-    requireRecord(snapshots, `pnpm lockfile document ${index + 1}.snapshots`);
-    const importers = document.importers ?? {};
-    requireRecord(importers, `pnpm lockfile document ${index + 1}.importers`);
+    const snapshots = requireRecord(document.snapshots ?? {}, `pnpm lockfile document ${index + 1}.snapshots`);
+    const importers = requireRecord(document.importers ?? {}, `pnpm lockfile document ${index + 1}.importers`);
     for (const importerPath of Object.keys(importers)) {
       importerPaths.add(normalizeImporterPath(importerPath, `pnpm lockfile document ${index + 1}.importers path`));
     }
     for (const [key, snapshotValue] of Object.entries(snapshots)) {
-      const snapshot = requireRecord(snapshotValue, `pnpm lockfile snapshots[${JSON.stringify(key)}]`);
-      for (const group of ['dependencies', 'optionalDependencies']) {
-        if (snapshot[group] !== undefined) requireRecord(snapshot[group], `pnpm lockfile snapshots[${JSON.stringify(key)}].${group}`);
+      const snapshotEntry = requireRecord(snapshotValue, `pnpm lockfile snapshots[${JSON.stringify(key)}]`);
+      for (const group of ['dependencies', 'optionalDependencies'] as const) {
+        if (snapshotEntry[group] !== undefined) requireRecord(snapshotEntry[group], `pnpm lockfile snapshots[${JSON.stringify(key)}].${group}`);
       }
       snapshotKeys.add(snapshotReference(key));
     }
@@ -299,17 +308,17 @@ function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockf
       invalid(`pnpm snapshot has no matching package entry: ${snapshot}`);
     }
   }
-  const uniqueRoots = new Map();
+  const uniqueRoots = new Map<string, RootDependency>();
   for (const root of roots) {
     const key = JSON.stringify(root);
     uniqueRoots.set(key, root);
   }
   return {
     id: requireText(projectId, 'project ID'),
-    manager: 'pnpm',
+    manager: 'pnpm' satisfies PackageManager,
     packageManagerPin,
     lockfilePath: requireText(lockfilePath, 'lockfile path'),
-    lockfileVersion: documents[0].lockfileVersion,
+    lockfileVersion: '9.0',
     targets,
     importers: [...importerPaths].sort(),
     roots: [...uniqueRoots.values()].sort((left, right) => left.importer.localeCompare(right.importer) || left.group.localeCompare(right.group) || left.requestedName.localeCompare(right.requestedName)),
@@ -318,17 +327,8 @@ function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockf
   };
 }
 
-async function decodePnpmDocuments(text) {
-  let yaml;
-  try {
-    yaml = await import('yaml');
-  } catch (cause) {
-    if (cause.code === 'ERR_MODULE_NOT_FOUND') {
-      throw new MynpmError('operation', 'pnpm lockfile import requires the pinned yaml@2.9.1 dependency; install locked project dependencies', { cause });
-    }
-    throw cause;
-  }
-  let documents;
+function decodeYamlDocuments(text: string, yaml: typeof import('yaml')): unknown[] {
+  let documents: ReturnType<typeof yaml.parseAllDocuments>;
   try {
     documents = yaml.parseAllDocuments(text, { uniqueKeys: true });
   } catch (cause) {
@@ -336,33 +336,63 @@ async function decodePnpmDocuments(text) {
   }
   const parseErrors = documents.flatMap(document => document.errors);
   if (parseErrors.length > 0) throw new MynpmError('input', `pnpm lockfile contains invalid YAML: ${parseErrors[0].message}`, { cause: parseErrors[0] });
-  const values = documents.map((document, index) => {
+  return documents.map((document, index) => {
     if (document.contents === null) invalid(`pnpm lockfile document ${index + 1} is empty`);
     try {
-      return document.toJS({ maxAliasCount: 100 });
+      const decoded: unknown = document.toJS({ maxAliasCount: 100 });
+      return decoded;
     } catch (cause) {
       throw new MynpmError('input', `pnpm lockfile document ${index + 1} cannot be decoded`, { cause });
     }
   });
-  return values;
 }
 
-export async function parsePnpmLock(text, options) {
-  return parsePnpmDocuments(await decodePnpmDocuments(text), options);
+function decodePnpmDocuments(text: string): Effect.Effect<unknown[], MynpmError> {
+  return Effect.gen(function*() {
+    const yaml = yield* Effect.tryPromise({
+      try: () => import('yaml'),
+      catch: cause => errorCode(cause) === 'ERR_MODULE_NOT_FOUND'
+        ? new MynpmError('operation', 'pnpm lockfile import requires the pinned yaml@2.9.1 dependency; install locked project dependencies', { cause })
+        : new MynpmError('operation', 'could not load the pinned yaml@2.9.1 dependency', { cause }),
+    });
+    return yield* Effect.try({
+      try: () => decodeYamlDocuments(text, yaml),
+      catch: cause => cause instanceof MynpmError ? cause : new MynpmError('input', 'pnpm lockfile is not valid YAML', { cause }),
+    });
+  });
 }
 
-export async function pnpmBuildPackageKeys(text) {
-  const documents = await decodePnpmDocuments(text);
-  const keys = new Set();
+export function parsePnpmLock(text: string, options: ParsePnpmLockOptions): Effect.Effect<ProjectRecord, MynpmError> {
+  return Effect.gen(function*() {
+    const documents = yield* decodePnpmDocuments(text);
+    return yield* Effect.try({
+      try: () => parsePnpmDocuments(documents, options),
+      catch: cause => cause instanceof MynpmError ? cause : new MynpmError('input', 'pnpm lockfile is invalid', { cause }),
+    });
+  });
+}
+
+function buildPackageKeys(values: unknown): string[] {
+  const documents = lockfileDocuments(values);
+  const keys = new Set<string>();
   for (const [index, document] of documents.entries()) {
-    const packages = document.packages ?? {};
-    requireRecord(packages, `pnpm lockfile document ${index + 1}.packages`);
+    const packages = requireRecord(document.packages ?? {}, `pnpm lockfile document ${index + 1}.packages`);
     for (const [key, entryValue] of Object.entries(packages)) {
       const entry = requireRecord(entryValue, `pnpm lockfile document ${index + 1}.packages[${JSON.stringify(key)}]`);
       if (entry.requiresBuild === true) keys.add(key);
     }
   }
   return [...keys].sort();
+}
+
+export function pnpmBuildPackageKeys(text: string): Effect.Effect<string[], MynpmError> {
+  return Effect.gen(function*() {
+    const documents = yield* decodePnpmDocuments(text);
+    return yield* Effect.try({
+      try: () => buildPackageKeys(documents),
+      catch: cause => cause instanceof MynpmError ? cause : new MynpmError('input', 'pnpm lockfile is invalid', { cause }),
+    });
+  });
 }
 
 export { parsePnpmDocuments };

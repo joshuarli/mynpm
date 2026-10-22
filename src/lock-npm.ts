@@ -1,45 +1,48 @@
-import { MynpmError } from './errors.mjs';
+import type { DependencyGroup, PackageFlags, PackageRecord, PackageManager, ProjectRecord, ProjectSnapshot, RootDependency } from './inventory.ts';
+import { MynpmError } from './errors.ts';
+
+type JsonRecord = Record<string, unknown>;
 
 const packageNamePattern = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 const versionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const integrityAlgorithms = new Map([['sha1', 20], ['sha256', 32], ['sha384', 48], ['sha512', 64]]);
-const dependencyGroups = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+const dependencyGroups: readonly DependencyGroup[] = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 
-function isRecord(value) {
+function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function requireRecord(value, label) {
+function requireRecord(value: unknown, label: string): JsonRecord {
   if (!isRecord(value)) throw new MynpmError('input', `${label} must be an object`);
   return value;
 }
 
-function requireText(value, label) {
+function requireText(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
     throw new MynpmError('input', `${label} must be a non-empty string`);
   }
   return value;
 }
 
-function requirePackageName(value, label) {
-  requireText(value, label);
-  if (!packageNamePattern.test(value)) throw new MynpmError('input', `${label} is not a valid package name`);
-  return value;
+function requirePackageName(value: unknown, label: string): string {
+  const name = requireText(value, label);
+  if (!packageNamePattern.test(name)) throw new MynpmError('input', `${label} is not a valid package name`);
+  return name;
 }
 
-function requireVersion(value, label, nullable) {
+function requireVersion(value: unknown, label: string, nullable: boolean): string | null {
   if (nullable && value === undefined) return null;
-  requireText(value, label);
-  if (!versionPattern.test(value)) throw new MynpmError('input', `${label} is not an exact package version`);
-  return value;
+  const version = requireText(value, label);
+  if (!versionPattern.test(version)) throw new MynpmError('input', `${label} is not an exact package version`);
+  return version;
 }
 
-function requireIntegrity(value, label) {
+function requireIntegrity(value: unknown, label: string): string | null {
   if (value === undefined) return null;
-  requireText(value, label);
-  const tokens = value.split(/\s+/);
+  const integrity = requireText(value, label);
+  const tokens = integrity.split(/\s+/);
   if (tokens.length === 0) throw new MynpmError('input', `${label} is malformed`);
-  const claims = new Map();
+  const claims = new Map<string, string>();
   for (const token of tokens) {
     const [claim] = token.split('?', 1);
     const separator = claim.indexOf('-');
@@ -57,10 +60,10 @@ function requireIntegrity(value, label) {
     if (claims.has(algorithm) && claims.get(algorithm) !== hex) throw new MynpmError('input', `${label} contains conflicting ${algorithm} claims`);
     claims.set(algorithm, hex);
   }
-  return value;
+  return integrity;
 }
 
-function packageNameFromKey(key) {
+function packageNameFromKey(key: string): string | null {
   const marker = 'node_modules/';
   const offset = key.lastIndexOf(marker);
   if (offset < 0) return null;
@@ -73,9 +76,9 @@ function packageNameFromKey(key) {
   return segments[0];
 }
 
-function sanitizeResolved(value, label) {
+function sanitizeResolved(value: string | null, label: string): { resolved: string | null; hadCredentials: boolean } {
   if (value === null || !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return { resolved: value, hadCredentials: false };
-  let url;
+  let url: URL;
   try {
     url = new URL(value);
   } catch (cause) {
@@ -91,13 +94,13 @@ function sanitizeResolved(value, label) {
   return { resolved: url.href, hadCredentials };
 }
 
-function classifySource(resolved, isLink, hadCredentials) {
+function classifySource(resolved: string | null, isLink: boolean, hadCredentials: boolean): PackageRecord['sourceKind'] {
   if (isLink || /^(?:file|link|workspace):/i.test(resolved ?? '')) return 'local';
   if (hadCredentials) return 'external-url';
   if (/^(?:git\+|git:|github:|ssh\+git:)/i.test(resolved ?? '')) return 'git';
   if (resolved === null) return 'unknown';
   if (/^https?:/i.test(resolved)) {
-    let url;
+    let url: URL;
     try {
       url = new URL(resolved);
     } catch (cause) {
@@ -110,45 +113,43 @@ function classifySource(resolved, isLink, hadCredentials) {
   return 'local';
 }
 
-function parsePlatform(entry, label) {
-  const result = {};
-  for (const field of ['os', 'cpu', 'libc']) {
+function parsePlatform(entry: JsonRecord, label: string): PackageRecord['platform'] {
+  const result: PackageRecord['platform'] = { os: null, cpu: null, libc: null };
+  for (const field of ['os', 'cpu', 'libc'] as const) {
     const value = entry[field];
-    if (value === undefined) {
-      result[field] = null;
-      continue;
-    }
-    const values = Array.isArray(value) ? value : [value];
+    if (value === undefined) continue;
+    const values: unknown[] = Array.isArray(value) ? value : [value];
     if (values.length === 0 || values.some(item => typeof item !== 'string' || item.length === 0)) {
       throw new MynpmError('input', `${label}.${field} must be a string or non-empty string array`);
     }
-    result[field] = [...new Set(values)].sort();
+    const strings = values.filter((item): item is string => typeof item === 'string');
+    result[field] = [...new Set(strings)].sort();
   }
   return result;
 }
 
-function parseFlags(entry, label) {
-  const flags = {};
-  for (const field of ['dev', 'optional', 'peer', 'peerOptional', 'link']) {
-    const value = field === 'link' ? entry.link : entry[field];
+function parseFlags(entry: JsonRecord, label: string): PackageFlags {
+  const flags: PackageFlags = { dev: false, optional: false, peer: false, peerOptional: false, link: false };
+  for (const field of ['dev', 'optional', 'peer', 'peerOptional', 'link'] as const) {
+    const value = entry[field];
     if (value !== undefined && typeof value !== 'boolean') {
       throw new MynpmError('input', `${label}.${field} must be a boolean`);
     }
-    flags[field] = value ?? false;
+    flags[field] = value === true;
   }
   return flags;
 }
 
-function exactTargetIds(targetIds) {
+function exactTargetIds(targetIds: unknown): string[] {
   if (!Array.isArray(targetIds) || targetIds.length === 0) {
     throw new MynpmError('input', 'at least one target ID is required for npm lockfile import');
   }
-  const values = targetIds.map((targetId, index) => requireText(targetId, `targetIds[${index}]`));
+  const values = targetIds.map((targetId: unknown, index: number) => requireText(targetId, `targetIds[${index}]`));
   if (new Set(values).size !== values.length) throw new MynpmError('input', 'target IDs must be unique');
   return values.sort();
 }
 
-function freezeDeep(value) {
+function freezeDeep<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
     for (const child of Object.values(value)) freezeDeep(child);
     Object.freeze(value);
@@ -156,53 +157,65 @@ function freezeDeep(value) {
   return value;
 }
 
-function normalizeSpecifier(specifier, requestedName) {
+function normalizeSpecifier(specifier: string, requestedName: string): string {
   if (!specifier.startsWith('npm:')) return requestedName;
   const target = specifier.slice(4);
-  let splitAt;
-  if (target.startsWith('@')) splitAt = target.lastIndexOf('@');
-  else splitAt = target.indexOf('@');
+  const splitAt = target.startsWith('@') ? target.lastIndexOf('@') : target.indexOf('@');
   return splitAt > 0 ? target.slice(0, splitAt) : target;
 }
 
-export function parseNpmLock(lock, { projectId, packageManagerPin = null, lockfilePath, targetIds, snapshot = null }) {
-  requireRecord(lock, 'npm lockfile');
-  if (lock.lockfileVersion !== 2 && lock.lockfileVersion !== 3) {
-    throw new MynpmError('input', `npm lockfileVersion must be 2 or 3; received ${String(lock.lockfileVersion)}`);
+export type ParseNpmLockOptions = {
+  projectId: string;
+  packageManagerPin?: string | null;
+  lockfilePath: string;
+  targetIds: unknown;
+  snapshot?: ProjectSnapshot | null;
+};
+
+export function parseNpmLock(lock: unknown, { projectId, packageManagerPin = null, lockfilePath, targetIds, snapshot = null }: ParseNpmLockOptions): ProjectRecord {
+  const lockRecord = requireRecord(lock, 'npm lockfile');
+  if (lockRecord.lockfileVersion !== 2 && lockRecord.lockfileVersion !== 3) {
+    throw new MynpmError('input', `npm lockfileVersion must be 2 or 3; received ${String(lockRecord.lockfileVersion)}`);
   }
+  const lockfileVersion = lockRecord.lockfileVersion;
   requireText(projectId, 'project ID');
   requireText(lockfilePath, 'lockfile path');
   const targets = exactTargetIds(targetIds);
-  const lockPackages = requireRecord(lock.packages, 'npm lockfile packages');
+  const lockPackages = requireRecord(lockRecord.packages, 'npm lockfile packages');
   const rootEntry = requireRecord(lockPackages[''], 'npm lockfile root package entry');
   const entries = Object.entries(lockPackages);
-  const workspaceEntries = new Map(entries.filter(([key]) => packageNameFromKey(key) === null));
-  const recordsByKey = new Map();
-  const packages = [];
+  const workspaceEntries = new Map<string, unknown>();
+  for (const [key, entry] of entries) {
+    if (packageNameFromKey(key) === null) workspaceEntries.set(key, entry);
+  }
+  const recordsByKey = new Map<string, PackageRecord>();
+  const packages: PackageRecord[] = [];
 
   for (const [key, entryValue] of entries) {
     const requestedName = packageNameFromKey(key);
     if (requestedName === null) continue;
     const label = `npm lockfile packages[${JSON.stringify(key)}]`;
     const entry = requireRecord(entryValue, label);
-    const linkTarget = entry.link && typeof entry.resolved === 'string'
-      ? workspaceEntries.get(entry.resolved.replace(/^file:/, ''))?.[1]
-      : undefined;
+    let linkTarget: JsonRecord | undefined;
+    if (entry.link && typeof entry.resolved === 'string') {
+      const resolvedWorkspace = workspaceEntries.get(entry.resolved.replace(/^file:/, ''));
+      if (resolvedWorkspace !== undefined) linkTarget = requireRecord(resolvedWorkspace, `${label}.link target`);
+    }
     const name = requirePackageName(entry.name ?? linkTarget?.name ?? requestedName, `${label}.name`);
     const version = requireVersion(entry.version ?? linkTarget?.version, `${label}.version`, entry.link === true);
     const resolvedValue = entry.resolved === undefined ? null : requireText(entry.resolved, `${label}.resolved`);
     const { resolved, hadCredentials } = sanitizeResolved(resolvedValue, `${label}.resolved`);
     const integrity = requireIntegrity(entry.integrity, `${label}.integrity`);
-    const link = entry.link ?? false;
-    if (typeof link !== 'boolean') throw new MynpmError('input', `${label}.link must be a boolean`);
+    const linkValue = entry.link ?? false;
+    if (typeof linkValue !== 'boolean') throw new MynpmError('input', `${label}.link must be a boolean`);
     const aliases = name === requestedName ? [] : [requestedName];
-    const packageRecord = {
+    const packageRecord: PackageRecord = {
       key,
       name,
       version,
       integrity,
       resolved,
-      sourceKind: classifySource(resolved, link, hadCredentials),
+      sourceKind: classifySource(resolved, linkValue, hadCredentials),
       aliases,
       flags: parseFlags(entry, label),
       platform: parsePlatform(entry, label),
@@ -212,12 +225,12 @@ export function parseNpmLock(lock, { projectId, packageManagerPin = null, lockfi
     recordsByKey.set(key, packageRecord);
   }
 
-  const roots = [];
+  const roots: RootDependency[] = [];
   for (const group of dependencyGroups) {
     const dependencies = rootEntry[group];
     if (dependencies === undefined) continue;
-    requireRecord(dependencies, `npm lockfile root ${group}`);
-    for (const [requestedName, specifierValue] of Object.entries(dependencies)) {
+    const dependencyRecords = requireRecord(dependencies, `npm lockfile root ${group}`);
+    for (const [requestedName, specifierValue] of Object.entries(dependencyRecords)) {
       requirePackageName(requestedName, `npm lockfile root ${group} package name`);
       const specifier = requireText(specifierValue, `npm lockfile root ${group}.${requestedName}`);
       const packageKey = `node_modules/${requestedName}`;
@@ -239,10 +252,10 @@ export function parseNpmLock(lock, { projectId, packageManagerPin = null, lockfi
   roots.sort((left, right) => left.group.localeCompare(right.group) || left.requestedName.localeCompare(right.requestedName));
   return freezeDeep({
     id: projectId,
-    manager: 'npm',
+    manager: 'npm' satisfies PackageManager,
     packageManagerPin,
     lockfilePath,
-    lockfileVersion: lock.lockfileVersion,
+    lockfileVersion,
     targets,
     importers: ['.'],
     roots,

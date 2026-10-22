@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { test } from 'node:test';
-import { renderPackumentFiles } from '../src/packument.mjs';
+import { test } from 'vitest';
+import { renderPackumentFiles } from '../src/packument.ts';
 
 function artifactRecord(name, version, bytes, packument, metadataOverrides = {}) {
   const sha512 = createHash('sha512').update(bytes).digest('hex');
@@ -89,7 +89,7 @@ test('packument preserves resolver metadata and emits only mirrored tags with st
   assert.equal(rendered.versions['1.2.4'].deprecated, 'use the next release');
   assert.deepEqual(rendered.versions['1.2.4'].bundleDependencies, ['bundled']);
   assert.equal(rendered.versions['1.2.4']._hasShrinkwrap, true);
-  assert.equal(rendered.versions['1.2.4'].dist.tarball, `https://deps.example.net/team/repo/tarballs/${records[1].artifact.sha512}.tgz`);
+  assert.equal(rendered.versions['1.2.4'].dist.tarball, `https://deps.example.net/team/repo/current/tarballs/${records[1].artifact.sha512}.tgz`);
   assert.equal(rendered.versions['1.2.4'].dist.integrity, records[1].artifact.integrity);
   assert.equal(rendered.versions['1.2.4'].dist.shasum, records[1].artifact.shasum);
   assert.equal(Object.hasOwn(rendered.versions['1.2.4'].dist, 'signatures'), false);
@@ -101,6 +101,13 @@ test('packument preserves resolver metadata and emits only mirrored tags with st
     modified: '2026-02-01T00:00:00.000Z',
   });
   assert.deepEqual(renderPackumentFiles([...records].reverse(), 'https://deps.example.net/team/repo/')[0].bytes, files[0].bytes);
+});
+
+test('renderer version 1 retains its original tarball URL layout', () => {
+  const record = artifactRecord('flatdemo', '1.2.3', Buffer.from('tarball'), { name: 'flatdemo', 'dist-tags': {}, time: {} });
+  const files = renderPackumentFiles([record], 'https://deps.example.net/team/repo/', { renderer: 1 });
+  const packument = JSON.parse(files[0].bytes.toString('utf8'));
+  assert.equal(packument.versions['1.2.3'].dist.tarball, `https://deps.example.net/team/repo/tarballs/${record.artifact.sha512}.tgz`);
 });
 
 test('packument rendering rejects unsafe package names and invalid public bases', () => {

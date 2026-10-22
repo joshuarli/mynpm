@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { test } from 'node:test';
-import { parsePnpmLock, parsePnpmDocuments, pnpmBuildPackageKeys } from '../src/lock-pnpm.mjs';
+import { it, test } from '@effect/vitest';
+import { Effect } from 'effect';
+import { parsePnpmLock, parsePnpmDocuments, pnpmBuildPackageKeys } from '../src/lock-pnpm.ts';
 
 const fixture = new URL('./fixtures/locks/pnpm-v9-local.yaml', import.meta.url);
 const twoDocumentFixture = new URL('./fixtures/locks/pnpm-v12-two-documents.yaml', import.meta.url);
@@ -15,8 +16,9 @@ try {
   else throw error;
 }
 
-test('pnpm v9 fixture is imported with the YAML document parser', { skip: !yamlAvailable }, async () => {
-  const project = await parsePnpmLock(await readFile(fixture, 'utf8'), {
+it.effect.skipIf(!yamlAvailable)('pnpm v9 fixture is imported with the YAML document parser', () => Effect.gen(function*() {
+  const text = yield* Effect.tryPromise(() => readFile(fixture, 'utf8'));
+  const project = yield* parsePnpmLock(text, {
     projectId: 'local',
     lockfilePath: 'pnpm-lock.yaml',
     targetIds: ['mac-arm64'],
@@ -30,11 +32,11 @@ test('pnpm v9 fixture is imported with the YAML document parser', { skip: !yamlA
   assert.deepEqual(project.roots.map(root => [root.importer, root.requestedName, root.packageVersion]), [
     ['.', 'local-dep', null],
   ]);
-});
+}));
 
-test('pnpm two-document YAML preserves manager and project packages for doctor and import', { skip: !yamlAvailable }, async () => {
-  const text = await readFile(twoDocumentFixture, 'utf8');
-  const project = await parsePnpmLock(text, {
+it.effect.skipIf(!yamlAvailable)('pnpm two-document YAML preserves manager and project packages for doctor and import', () => Effect.gen(function*() {
+  const text = yield* Effect.tryPromise(() => readFile(twoDocumentFixture, 'utf8'));
+  const project = yield* parsePnpmLock(text, {
     projectId: 'two-documents',
     lockfilePath: 'pnpm-lock.yaml',
     targetIds: ['linux-x64-gnu'],
@@ -47,8 +49,8 @@ test('pnpm two-document YAML preserves manager and project packages for doctor a
   assert.deepEqual(project.roots.map(root => [root.group, root.requestedName, root.packageVersion]), [
     ['dependencies', 'private-download', '1.0.0'],
   ]);
-  assert.deepEqual(await pnpmBuildPackageKeys(text), ['private-download@1.0.0']);
-});
+  assert.deepEqual(yield* pnpmBuildPackageKeys(text), ['private-download@1.0.0']);
+}));
 
 test('pnpm documents union packages, roots, aliases, and peer-context snapshots', () => {
   const documents = [

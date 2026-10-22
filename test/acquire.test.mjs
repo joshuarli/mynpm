@@ -4,14 +4,15 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { Readable } from 'node:stream';
-import { test } from 'node:test';
+import { it } from '@effect/vitest';
+import { Deferred, Effect, Fiber } from 'effect';
 import { fileURLToPath } from 'node:url';
-import { parseConfig } from '../src/config.mjs';
-import { createEmptyInventory, mergeProject } from '../src/inventory.mjs';
-import { parseNpmLock } from '../src/lock-npm.mjs';
-import { loadInventory, saveInventory } from '../src/inventory-store.mjs';
-import { fetchInventory, verifyInventory } from '../src/acquire.mjs';
-import { limits } from '../src/limits.mjs';
+import { parseConfig } from '../src/config.ts';
+import { createEmptyInventory, mergeProject } from '../src/inventory.ts';
+import { parseNpmLock } from '../src/lock-npm.ts';
+import { loadInventory, saveInventory } from '../src/inventory-store.ts';
+import { fetchInventory, verifyInventory } from '../src/acquire.ts';
+import { limits } from '../src/limits.ts';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const scratchRoot = join(repositoryRoot, '.work', 'tmp');
@@ -87,13 +88,15 @@ function response(statusCode, body, headers = {}) {
   return { statusCode, headers: { 'content-length': String(bytes.length), ...headers }, body: Readable.from([bytes]), close() {} };
 }
 
-async function withScratch(run) {
-  const directory = mkdtempSync(join(scratchRoot, 'acquire-'));
-  try {
-    return await run(directory);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
+function withScratch(run) {
+  return Effect.acquireUseRelease(
+    Effect.sync(() => {
+      mkdirSync(scratchRoot, { recursive: true });
+      return mkdtempSync(join(scratchRoot, 'acquire-'));
+    }),
+    run,
+    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
+  );
 }
 
 function dependenciesFor(packages, overrides = {}) {
@@ -119,16 +122,16 @@ function dependenciesFor(packages, overrides = {}) {
   };
 }
 
-test('fetch verifies, stores and records one artifact; repeated fetch reuses it and verify detects corruption', async () => withScratch(async directory => {
+it.effect('fetch verifies, stores and records one artifact; repeated fetch reuses it and verify detects corruption', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const dependencies = dependenciesFor([pkg]);
-  await fetchInventory({ stateDirectory, config }, dependencies);
+  yield* fetchInventory({ stateDirectory, config }, dependencies);
 
-  const inventory = await loadInventory(stateDirectory);
+  const inventory = yield* loadInventory(stateDirectory);
   const record = inventory.artifacts[0];
   const objectPath = join(stateDirectory, 'objects', 'sha512', `${record.artifact.sha512}.tgz`);
   assert.deepEqual(readFileSync(objectPath), bytes);
@@ -137,18 +140,18 @@ test('fetch verifies, stores and records one artifact; repeated fetch reuses it 
   assert.deepEqual(record.metadata.engines, { node: '>=22' });
   assert.deepEqual(record.packument['dist-tags'], { latest: '1.2.3' });
   assert.equal(record.artifact.sha512, createHash('sha512').update(bytes).digest('hex'));
-  assert.equal((await verifyInventory({ stateDirectory, config })).verifiedCount, 1);
+  assert.equal((yield* verifyInventory({ stateDirectory, config })).verifiedCount, 1);
 
   const inventoryBytes = readFileSync(join(stateDirectory, 'inventory.json'));
-  await fetchInventory({ stateDirectory, config }, {
+  yield* fetchInventory({ stateDirectory, config }, {
     exchange: async () => { throw new Error('matching fetch made a request'); },
     resolveAddresses: async () => { throw new Error('matching fetch resolved DNS'); },
   });
-  assert.equal((await verifyInventory({ stateDirectory, config })).verifiedCount, 1);
+  assert.equal((yield* verifyInventory({ stateDirectory, config })).verifiedCount, 1);
   assert.deepEqual(readFileSync(join(stateDirectory, 'inventory.json')), inventoryBytes);
   unlinkSync(objectPath);
   const retryUrls = [];
-  const recovered = await fetchInventory({ stateDirectory, config }, {
+  const recovered = yield* fetchInventory({ stateDirectory, config }, {
     ...dependencies,
     exchange: async (url, options) => {
       retryUrls.push(url.href);
@@ -159,70 +162,75 @@ test('fetch verifies, stores and records one artifact; repeated fetch reuses it 
   assert.deepEqual(retryUrls, [record.metadata.dist.tarball]);
   assert.deepEqual(readFileSync(objectPath), bytes);
   writeFileSync(objectPath, Buffer.from('corrupt'));
-  await assert.rejects(verifyInventory({ stateDirectory, config }), /SHA-512/);
+  const corruptFailure = yield* Effect.flip(verifyInventory({ stateDirectory, config }));
+  assert.match(corruptFailure.message, /SHA-512/);
   unlinkSync(objectPath);
   const outside = join(directory, 'outside.tgz');
   writeFileSync(outside, bytes);
   symlinkSync(outside, objectPath);
-  await assert.rejects(verifyInventory({ stateDirectory, config }), /regular file/);
-}));
+  const symlinkFailure = yield* Effect.flip(verifyInventory({ stateDirectory, config }));
+  assert.match(symlinkFailure.message, /regular file/);
+})));
 
-test('fetch rejects corrupt bytes and a tarball whose package manifest has another identity', async () => withScratch(async directory => {
+it.effect('fetch rejects corrupt bytes and a tarball whose package manifest has another identity', () => withScratch(directory => Effect.gen(function*() {
   const expected = packageTar('flatdemo', '1.2.3');
   const wrongIdentity = packageTar('other', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes: expected };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, expected);
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg], { integrity: false }));
+  yield* saveInventory(stateDirectory, makeInventory([pkg], { integrity: false }));
   const corrupt = dependenciesFor([{ ...pkg, bytes: Buffer.from('corrupt') }]);
 
-  await assert.rejects(fetchInventory({ stateDirectory, config }, corrupt), /integrity/);
+  const corruptFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, corrupt));
+  assert.match(corruptFailure.message, /integrity/);
   assert.equal(existsSync(join(stateDirectory, 'objects')), false);
-  const afterCorrupt = await loadInventory(stateDirectory);
+  const afterCorrupt = yield* loadInventory(stateDirectory);
   assert.equal(afterCorrupt.artifacts.length, 0);
 
   const mismatched = dependenciesFor([{ ...pkg, bytes: wrongIdentity, metadata: packageMetadata(pkg.name, pkg.version, wrongIdentity) }]);
-  await assert.rejects(fetchInventory({ stateDirectory, config }, mismatched), /identity mismatch/);
-  assert.equal((await loadInventory(stateDirectory)).artifacts.length, 0);
-}));
+  const identityFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, mismatched));
+  assert.match(identityFailure.message, /identity mismatch/);
+  assert.equal((yield* loadInventory(stateDirectory)).artifacts.length, 0);
+})));
 
-test('SHA-1-only artifacts require the explicit legacy policy and never reach storage on rejection', async () => withScratch(async directory => {
+it.effect('SHA-1-only artifacts require the explicit legacy policy and never reach storage on rejection', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('legacy', '1.0.0');
   const pkg = { name: 'legacy', version: '1.0.0', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes, { sha512: false });
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg], { integrity: false }));
+  yield* saveInventory(stateDirectory, makeInventory([pkg], { integrity: false }));
   const dependencies = dependenciesFor([pkg]);
 
-  await assert.rejects(fetchInventory({ stateDirectory, config }, dependencies), /SHA-1-only/);
-  assert.equal((await loadInventory(stateDirectory)).artifacts.length, 0);
+  const legacyFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, dependencies));
+  assert.match(legacyFailure.message, /SHA-1-only/);
+  assert.equal((yield* loadInventory(stateDirectory)).artifacts.length, 0);
   const legacyConfig = structuredClone(config);
   legacyConfig.policy.allowLegacySha1Only = true;
-  await fetchInventory({ stateDirectory, config: legacyConfig }, dependencies);
-  const record = (await loadInventory(stateDirectory)).artifacts[0];
+  yield* fetchInventory({ stateDirectory, config: legacyConfig }, dependencies);
+  const record = (yield* loadInventory(stateDirectory)).artifacts[0];
   assert.equal(record.artifact.legacySha1Only, true);
-  assert.equal((await verifyInventory({ stateDirectory, config: legacyConfig })).verifiedCount, 1);
-}));
+  assert.equal((yield* verifyInventory({ stateDirectory, config: legacyConfig })).verifiedCount, 1);
+})));
 
-test('fetch does not invent historical SHA-1 metadata when upstream supplies none', async () => withScratch(async directory => {
+it.effect('fetch does not invent historical SHA-1 metadata when upstream supplies none', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('no-sha1', '1.0.0');
   const pkg = { name: 'no-sha1', version: '1.0.0', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes, { shasum: false });
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
 
-  await fetchInventory({ stateDirectory, config }, dependenciesFor([pkg]));
-  const record = (await loadInventory(stateDirectory)).artifacts[0];
+  yield* fetchInventory({ stateDirectory, config }, dependenciesFor([pkg]));
+  const record = (yield* loadInventory(stateDirectory)).artifacts[0];
   assert.equal(record.artifact.shasum, null);
-  assert.equal((await verifyInventory({ stateDirectory, config })).verifiedCount, 1);
-}));
+  assert.equal((yield* verifyInventory({ stateDirectory, config })).verifiedCount, 1);
+})));
 
-test('fetch requests scoped metadata with an encoded slash', async () => withScratch(async directory => {
+it.effect('fetch requests scoped metadata with an encoded slash', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('@scope/demo', '1.0.0');
   const pkg = { name: '@scope/demo', version: '1.0.0', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const urls = [];
   const dependencies = dependenciesFor([pkg], {
     exchange: async (url, options) => {
@@ -231,27 +239,25 @@ test('fetch requests scoped metadata with an encoded slash', async () => withScr
     },
   });
 
-  await fetchInventory({ stateDirectory, config }, dependencies);
+  yield* fetchInventory({ stateDirectory, config }, dependencies);
   assert.match(urls[0], /@scope%2fdemo$/);
-  assert.equal((await verifyInventory({ stateDirectory, config })).verifiedCount, 1);
-}));
+  assert.equal((yield* verifyInventory({ stateDirectory, config })).verifiedCount, 1);
+})));
 
-test('fetch rejects unsafe redirects and oversized response declarations before writing objects', async () => withScratch(async directory => {
+it.effect('fetch rejects unsafe redirects and oversized response declarations before writing objects', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const redirects = dependenciesFor([pkg], {
     exchange: async url => url.pathname.endsWith('.tgz')
       ? response(302, '', { location: 'https://registry-user:sensitive-secret@127.0.0.1/private.tgz?token=sensitive-token' })
       : response(200, JSON.stringify({ name: 'flatdemo', versions: { '1.2.3': pkg.metadata } })),
   });
-  await assert.rejects(fetchInventory({ stateDirectory, config }, redirects), error => {
-    assert.match(error.message, /allowlisted HTTPS registry/);
-    assert.doesNotMatch(error.message, /sensitive-secret|sensitive-token/);
-    return true;
-  });
+  const redirectFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, redirects));
+  assert.match(redirectFailure.message, /allowlisted HTTPS registry/);
+  assert.doesNotMatch(redirectFailure.message, /sensitive-secret|sensitive-token/);
   assert.equal(existsSync(join(stateDirectory, 'objects')), false);
 
   let redirectCount = 0;
@@ -262,33 +268,37 @@ test('fetch rejects unsafe redirects and oversized response declarations before 
       return response(302, '', { location: `https://registry.npmjs.org/redirect-${redirectCount}.tgz` });
     },
   });
-  await assert.rejects(fetchInventory({ stateDirectory, config }, tooManyRedirects), /5 redirect limit/);
+  const redirectLimitFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, tooManyRedirects));
+  assert.match(redirectLimitFailure.message, /5 redirect limit/);
   assert.equal(redirectCount, 6);
 
   const privateResolution = dependenciesFor([pkg], { resolveAddresses: async () => [{ address: '127.0.0.1', family: 4 }] });
-  await assert.rejects(fetchInventory({ stateDirectory, config }, privateResolution), /non-public address/);
+  const privateAddressFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, privateResolution));
+  assert.match(privateAddressFailure.message, /non-public address/);
 
   const oversized = dependenciesFor([pkg], {
     exchange: async url => url.pathname.endsWith('.tgz')
       ? response(200, '', { 'content-length': String(1024 ** 3 + 1) })
       : response(200, JSON.stringify({ name: 'flatdemo', versions: { '1.2.3': pkg.metadata } })),
   });
-  await assert.rejects(fetchInventory({ stateDirectory, config }, oversized), /1 GiB/);
-  assert.equal((await loadInventory(stateDirectory)).artifacts.length, 0);
+  const oversizedFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, oversized));
+  assert.match(oversizedFailure.message, /1 GiB/);
+  assert.equal((yield* loadInventory(stateDirectory)).artifacts.length, 0);
 
   const oversizedMetadata = dependenciesFor([pkg], {
-    exchange: async url => response(200, '{}', { 'content-length': String(64 * 1024 ** 2 + 1) }),
+    exchange: async _url => response(200, '{}', { 'content-length': String(64 * 1024 ** 2 + 1) }),
   });
-  await assert.rejects(fetchInventory({ stateDirectory, config }, oversizedMetadata), /64 MiB/);
-  assert.equal((await loadInventory(stateDirectory)).artifacts.length, 0);
-}));
+  const oversizedMetadataFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, oversizedMetadata));
+  assert.match(oversizedMetadataFailure.message, /64 MiB/);
+  assert.equal((yield* loadInventory(stateDirectory)).artifacts.length, 0);
+})));
 
-test('fetch enforces the metadata limit while streaming when Content-Length is absent', async () => withScratch(async directory => {
+it.effect('fetch enforces the metadata limit while streaming when Content-Length is absent', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const chunk = Buffer.alloc(1024 ** 2);
   const oversized = dependenciesFor([pkg], {
     exchange: async () => ({
@@ -301,46 +311,48 @@ test('fetch enforces the metadata limit while streaming when Content-Length is a
     }),
   });
 
-  await assert.rejects(fetchInventory({ stateDirectory, config }, oversized), /64 MiB/);
-  assert.equal((await loadInventory(stateDirectory)).artifacts.length, 0);
+  const oversizedFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, oversized));
+  assert.match(oversizedFailure.message, /64 MiB/);
+  assert.equal((yield* loadInventory(stateDirectory)).artifacts.length, 0);
   assert.equal(existsSync(join(stateDirectory, 'objects')), false);
-}));
+})));
 
-test('fetch stops aborted streams and removes private staging files', async () => withScratch(async directory => {
+it.effect('fetch stops aborted streams and removes private staging files', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg]));
-  const controller = new AbortController();
-  let started;
-  const bodyStarted = new Promise(resolve => { started = resolve; });
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
+  const bodyStarted = yield* Deferred.make();
   const dependencies = dependenciesFor([pkg], {
-    exchange: async url => {
+    exchange: async (url, { signal }) => {
       if (!url.pathname.endsWith('.tgz')) return response(200, JSON.stringify({ name: 'flatdemo', versions: { '1.2.3': pkg.metadata } }));
       return {
         statusCode: 200,
         headers: { 'content-length': String(bytes.length) },
         body: Readable.from((async function* () {
-          started();
+          Effect.runSync(Deferred.succeed(bodyStarted, undefined));
           yield bytes.subarray(0, 4);
-          await new Promise((resolve, reject) => {
-            controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true });
+          await new Promise((_resolve, reject) => {
+            const abort = () => reject(signal.reason);
+            if (signal.aborted) abort();
+            else signal.addEventListener('abort', abort, { once: true });
           });
         })()),
         close() {},
       };
     },
   });
-  const fetching = fetchInventory({ stateDirectory, config, signal: controller.signal }, dependencies);
-  await bodyStarted;
-  controller.abort();
-  await assert.rejects(fetching, error => error.category === 'cancelled');
+  const fetching = yield* Effect.forkChild(fetchInventory({ stateDirectory, config }, dependencies));
+  yield* Deferred.await(bodyStarted);
+  yield* Fiber.interrupt(fetching);
+  const exit = yield* Fiber.await(fetching);
+  assert.equal(exit._tag, 'Failure');
   assert.deepEqual(readdirSync(join(stateDirectory, 'tmp')), []);
   assert.equal(existsSync(join(stateDirectory, 'objects')), false);
-}));
+})));
 
-test('fetch removes interrupted staging from a dead fetch process before acquiring artifacts', async () => withScratch(async directory => {
+it.effect('fetch removes interrupted staging from a dead fetch process before acquiring artifacts', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
@@ -349,19 +361,19 @@ test('fetch removes interrupted staging from a dead fetch process before acquiri
   const interrupted = join(stagingRoot, 'mynpm-fetch-2147483647-interrupted');
   mkdirSync(interrupted, { recursive: true });
   writeFileSync(join(interrupted, 'partial.part'), Buffer.from('unverified'));
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
 
-  await fetchInventory({ stateDirectory, config }, dependenciesFor([pkg]));
+  yield* fetchInventory({ stateDirectory, config }, dependenciesFor([pkg]));
   assert.deepEqual(readdirSync(stagingRoot), []);
-  assert.equal((await verifyInventory({ stateDirectory, config })).verifiedCount, 1);
-}));
+  assert.equal((yield* verifyInventory({ stateDirectory, config })).verifiedCount, 1);
+})));
 
-test('fetch enforces per-request and whole-operation timeouts through controlled timers', async () => withScratch(async directory => {
+it.effect('fetch enforces per-request and whole-operation timeouts through controlled timers', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const controlled = firingDelay => ({
     scheduleTimeout(callback, delay) {
       const timer = { cleared: false };
@@ -378,22 +390,20 @@ test('fetch enforces per-request and whole-operation timeouts through controlled
       else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
     }),
   };
-  await assert.rejects(
-    fetchInventory({ stateDirectory, config }, waitingRequest),
-    error => error.category === 'operation' && /10 minutes/.test(error.message),
-  );
+  const requestTimeout = yield* Effect.flip(fetchInventory({ stateDirectory, config }, waitingRequest));
+  assert.equal(requestTimeout.category, 'operation');
+  assert.match(requestTimeout.message, /10 minutes/);
 
-  await assert.rejects(
-    fetchInventory({ stateDirectory, config }, {
-      ...dependenciesFor([pkg]),
-      ...controlled(limits.fetchMilliseconds),
-    }),
-    error => error.category === 'operation' && /1 hour/.test(error.message),
-  );
-  assert.equal((await loadInventory(stateDirectory)).artifacts.length, 0);
-}));
+  const fetchTimeout = yield* Effect.flip(fetchInventory({ stateDirectory, config }, {
+    ...dependenciesFor([pkg]),
+    ...controlled(limits.fetchMilliseconds),
+  }));
+  assert.equal(fetchTimeout.category, 'operation');
+  assert.match(fetchTimeout.message, /1 hour/);
+  assert.equal((yield* loadInventory(stateDirectory)).artifacts.length, 0);
+})));
 
-test('fetch rejects symbolic-link staging and object-store directories without writing through them', async () => withScratch(async directory => {
+it.effect('fetch rejects symbolic-link staging and object-store directories without writing through them', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
   const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
   pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
@@ -401,23 +411,25 @@ test('fetch rejects symbolic-link staging and object-store directories without w
   const outside = join(directory, 'outside');
   mkdirSync(stateDirectory);
   mkdirSync(outside);
-  await saveInventory(stateDirectory, makeInventory([pkg]));
+  yield* saveInventory(stateDirectory, makeInventory([pkg]));
   symlinkSync(outside, join(stateDirectory, 'tmp'));
 
-  await assert.rejects(fetchInventory({ stateDirectory, config }, dependenciesFor([pkg])), /managed directory is not a real directory/);
+  const stagingFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, dependenciesFor([pkg])));
+  assert.match(stagingFailure.message, /managed directory is not a real directory/);
   assert.deepEqual(readdirSync(outside), []);
 
   const objectState = join(directory, 'object-state');
   const objectOutside = join(directory, 'object-outside');
   mkdirSync(objectState);
   mkdirSync(objectOutside);
-  await saveInventory(objectState, makeInventory([pkg]));
+  yield* saveInventory(objectState, makeInventory([pkg]));
   symlinkSync(objectOutside, join(objectState, 'objects'));
-  await assert.rejects(fetchInventory({ stateDirectory: objectState, config }, dependenciesFor([pkg])), /object store directory is not a real directory/);
+  const objectFailure = yield* Effect.flip(fetchInventory({ stateDirectory: objectState, config }, dependenciesFor([pkg])));
+  assert.match(objectFailure.message, /object store directory is not a real directory/);
   assert.deepEqual(readdirSync(objectOutside), []);
-}));
+})));
 
-test('fetch caps active acquisition at four concurrent packages', async () => withScratch(async directory => {
+it.effect('fetch caps active acquisition at four concurrent packages', () => withScratch(directory => Effect.gen(function*() {
   const packages = Array.from({ length: 5 }, (_, index) => {
     const name = `package-${index}`;
     const version = '1.0.0';
@@ -425,7 +437,7 @@ test('fetch caps active acquisition at four concurrent packages', async () => wi
     return { name, version, bytes, metadata: packageMetadata(name, version, bytes) };
   });
   const stateDirectory = join(directory, 'state');
-  await saveInventory(stateDirectory, makeInventory(packages));
+  yield* saveInventory(stateDirectory, makeInventory(packages));
   let active = 0;
   let peak = 0;
   let notifyBatch;
@@ -443,16 +455,16 @@ test('fetch caps active acquisition at four concurrent packages', async () => wi
       if (held === 4) notifyBatch();
       if (held <= 4) await batchGate;
       const result = await base.exchange(url);
-      const close = result.close;
-      result.close = () => { active -= 1; close(); };
+      const close = result.close?.bind(result);
+      result.close = () => { active -= 1; close?.(); };
       return result;
     },
   };
-  const fetching = fetchInventory({ stateDirectory, config }, dependencies);
-  await firstBatch;
+  const fetching = yield* Effect.forkChild(fetchInventory({ stateDirectory, config }, dependencies));
+  yield* Effect.tryPromise(() => firstBatch);
   assert.equal(peak, 4);
   releaseBatch();
-  await fetching;
+  yield* Fiber.join(fetching);
   assert.equal(peak, 4);
-  assert.equal((await verifyInventory({ stateDirectory, config })).verifiedCount, 5);
-}));
+  assert.equal((yield* verifyInventory({ stateDirectory, config })).verifiedCount, 5);
+})));

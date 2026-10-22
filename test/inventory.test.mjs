@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { test } from 'node:test';
-import { parseNpmLock } from '../src/lock-npm.mjs';
-import { createEmptyInventory, mergeProject, parseInventory, recordVerifiedArtifact, serializeInventory } from '../src/inventory.mjs';
+import { test } from 'vitest';
+import { parseNpmLock } from '../src/lock-npm.ts';
+import { createEmptyInventory, mergeProject, parseInventory, recordVerifiedArtifact, serializeInventory } from '../src/inventory.ts';
 
 const lock = JSON.parse(readFileSync(new URL('./fixtures/locks/package-lock-v3.json', import.meta.url), 'utf8'));
 

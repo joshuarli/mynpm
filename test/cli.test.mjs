@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { test } from 'node:test';
+import { test } from 'vitest';
 import { fileURLToPath } from 'node:url';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const scratchRoot = join(repositoryRoot, '.work', 'tmp');
-const cliPath = join(repositoryRoot, 'src', 'cli.mjs');
+const cliPath = join(repositoryRoot, 'src', 'cli.ts');
 const configPath = join(repositoryRoot, 'test', 'fixtures', 'mynpm.json');
 const lockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'package-lock-v3.json');
 const addLockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'package-lock-add.json');
@@ -34,7 +34,7 @@ function withScratch(run) {
 function runCli(scratch, args, overrides = {}) {
   const temporaryDirectory = join(scratch, 'tmp');
   mkdirSync(temporaryDirectory, { recursive: true });
-  return spawnSync(process.execPath, [cliPath, ...args], {
+  return spawnSync(process.execPath, ['--experimental-strip-types', cliPath, ...args], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
@@ -272,7 +272,7 @@ test('doctor reports external sources without changing the project', () => withS
   const result = runCli(scratch, ['--config', configPath, 'doctor', projectDirectory]);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /third-party-download: external-tarball/);
-  assert.match(result.stdout, /local-source: workspace-link/);
+  assert.match(result.stdout, /local-source: workspace@1\.0\.0/);
   assert.match(result.stdout, /git-source: git-source/);
   assert.match(result.stdout, /private-host: private-host/);
   assert.match(result.stdout, /install\/build hook: private-host/);
@@ -287,7 +287,7 @@ test('doctor reports external sources without changing the project', () => withS
   assert.deepEqual(readdirSync(projectDirectory).sort(), ['package-lock.json', 'package.json']);
 }));
 
-test('doctor reports pnpm sources and build hooks without changing the project', { skip: !yamlAvailable }, () => withScratch(scratch => {
+test.skipIf(!yamlAvailable)('doctor reports pnpm sources and build hooks without changing the project', () => withScratch(scratch => {
   const projectDirectory = join(scratch, 'pnpm-project');
   mkdirSync(projectDirectory);
   const lockBytes = readFileSync(pnpmLockfilePath);

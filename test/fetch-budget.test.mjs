@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { createFetchByteBudget } from '../src/fetch-budget.mjs';
-import { limits } from '../src/limits.mjs';
+import { test } from 'vitest';
+import { createFetchByteBudget } from '../src/fetch-budget.ts';
+import { limits } from '../src/limits.ts';
 
 test('fetch byte budget accepts the exact cap and rejects the next byte', () => {
   const budget = createFetchByteBudget();

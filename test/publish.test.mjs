@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import { join, relative, resolve } from 'node:path';
 import { once } from 'node:events';
-import { test } from 'node:test';
+import { it } from '@effect/vitest';
+import { Effect, Fiber } from 'effect';
 import { fileURLToPath } from 'node:url';
-import { parseConfig } from '../src/config.mjs';
-import { createEmptyInventory, mergeProject, recordVerifiedArtifact } from '../src/inventory.mjs';
-import { parseNpmLock } from '../src/lock-npm.mjs';
-import { publishSite } from '../src/publish.mjs';
-import { saveInventory } from '../src/inventory-store.mjs';
-import { runProcess } from '../src/process.mjs';
+import { parseConfig } from '../src/config.ts';
+import { createEmptyInventory, mergeProject, recordVerifiedArtifact } from '../src/inventory.ts';
+import { parseNpmLock } from '../src/lock-npm.ts';
+import { publishSite } from '../src/publish.ts';
+import { renderPackumentFiles } from '../src/packument.ts';
+import { saveInventory } from '../src/inventory-store.ts';
+import { runProcess } from '../src/process.ts';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const workDirectory = join(repositoryRoot, '.work');
@@ -107,23 +109,38 @@ function makeInventory(packages, projectId = 'app') {
   }), mergeProject(createEmptyInventory(), project));
 }
 
-async function saveState(stateDirectory, packages, projectId = 'app') {
-  await saveInventory(stateDirectory, makeInventory(packages, projectId));
-  for (const pkg of packages) {
-    const objectDirectory = join(stateDirectory, 'objects', 'sha512');
-    mkdirSync(objectDirectory, { recursive: true });
-    writeFileSync(join(objectDirectory, `${pkg.artifact.sha512}.tgz`), pkg.bytes);
-  }
+function saveState(stateDirectory, packages, projectId = 'app') {
+  return Effect.gen(function*() {
+    yield* saveInventory(stateDirectory, makeInventory(packages, projectId));
+    for (const pkg of packages) {
+      const objectDirectory = join(stateDirectory, 'objects', 'sha512');
+      mkdirSync(objectDirectory, { recursive: true });
+      writeFileSync(join(objectDirectory, `${pkg.artifact.sha512}.tgz`), pkg.bytes);
+    }
+  });
 }
 
-async function withScratch(run) {
-  mkdirSync(scratchRoot, { recursive: true });
-  const directory = mkdtempSync(join(scratchRoot, 'publish-'));
-  try {
-    return await run(directory);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
+function withScratch(run) {
+  return Effect.acquireUseRelease(
+    Effect.sync(() => {
+      mkdirSync(scratchRoot, { recursive: true });
+      return mkdtempSync(join(scratchRoot, 'publish-'));
+    }),
+    run,
+    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
+  );
+}
+
+function promiseEffect(operation) {
+  return Effect.tryPromise({ try: operation, catch: cause => cause });
+}
+
+function assertEffectRejects(effect, expected) {
+  return Effect.gen(function*() {
+    const outcome = yield* Effect.result(effect);
+    assert.equal(outcome._tag, 'Failure');
+    if (outcome._tag === 'Failure') assert.match(outcome.failure.message, expected);
+  });
 }
 
 function publishOptions(directory, stateDirectory, siteDirectory, overrides = {}) {
@@ -139,75 +156,127 @@ function currentTarget(siteDirectory) {
   return readlinkSync(join(siteDirectory, 'mirror', 'current'));
 }
 
-test('publish creates complete immutable generations, retains old versions, and no-ops unchanged', async () => withScratch(async directory => {
+function canonicalValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalValue(value[key])]));
+}
+
+function generationId(publicBaseUrl, artifacts, packuments, rendererVersion) {
+  const payload = {
+    schemaVersion: 1,
+    rendererVersion,
+    publicBaseUrl,
+    artifacts: artifacts.map(record => ({ name: record.name, version: record.version, sha512: record.artifact.sha512 })),
+    packuments: packuments.map(file => ({ path: file.path, contents: file.bytes.toString('utf8') })),
+  };
+  return createHash('sha256').update(`${JSON.stringify(canonicalValue(payload), null, 2)}\n`).digest('hex');
+}
+
+it.effect('publish creates complete immutable generations, retains old versions, and no-ops unchanged', () => withScratch(directory => Effect.gen(function*() {
   const stateDirectory = join(directory, 'state');
   const siteDirectory = join(directory, 'site');
   const first = makePackage('flatdemo', '1.2.3');
   const second = makePackage('@scope/demo', '2.3.4');
-  await saveState(stateDirectory, [first]);
+  yield* saveState(stateDirectory, [first]);
 
-  const published = await publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  const published = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   const firstTarget = currentTarget(siteDirectory);
   assert.equal(firstTarget, `generations/${published.generationId}`);
   assert.equal(published.packageCount, 1);
   assert.equal(published.versionCount, 1);
   assert.equal(lstatSync(join(siteDirectory, 'mirror', firstTarget)).isDirectory(), true);
   assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
+  assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'current', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
+  assert.equal(statSync(join(siteDirectory, 'mirror', 'current', 'tarballs', `${first.artifact.sha512}.tgz`)).ino, statSync(join(siteDirectory, 'mirror', 'tarballs', `${first.artifact.sha512}.tgz`)).ino);
 
-  const noOp = await publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  const noOp = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   assert.equal(noOp.noOp, true);
   assert.equal(currentTarget(siteDirectory), firstTarget);
 
-  await saveState(stateDirectory, [second], 'web');
-  const expanded = await publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  yield* saveState(stateDirectory, [second], 'web');
+  const expanded = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   assert.equal(expanded.noOp, false);
   assert.equal(expanded.packageCount, 2);
   assert.equal(expanded.versionCount, 2);
   assert.notEqual(currentTarget(siteDirectory), firstTarget);
   assert.equal(existsSync(join(siteDirectory, 'mirror', firstTarget, 'manifest.json')), true);
   assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
+  assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'current', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
   const scoped = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', '@scope', 'demo'), 'utf8'));
-  assert.equal(scoped.versions['2.3.4'].dist.tarball, `https://deps.example.net/mirror/tarballs/${second.artifact.sha512}.tgz`);
-  const repeated = await publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  assert.equal(scoped.versions['2.3.4'].dist.tarball, `https://deps.example.net/mirror/current/tarballs/${second.artifact.sha512}.tgz`);
+  const repeated = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   assert.equal(repeated.noOp, true);
   assert.equal(repeated.generationId, expanded.generationId);
-}));
+})));
 
-test('publish rejects symbolic-link destination components', async () => withScratch(async directory => {
+it.effect('publish upgrades renderer-version-1 generations without losing their readable layout', () => withScratch(directory => Effect.gen(function*() {
   const stateDirectory = join(directory, 'state');
-  await saveState(stateDirectory, []);
+  const siteDirectory = join(directory, 'site');
+  const pkg = makePackage('flatdemo', '1.2.3');
+  yield* saveState(stateDirectory, [pkg]);
+  yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+
+  const publicBaseUrl = config.publicBaseUrl;
+  const artifacts = makeInventory([pkg]).artifacts;
+  const packuments = renderPackumentFiles(artifacts, publicBaseUrl, { renderer: 1 });
+  const oldGenerationId = generationId(publicBaseUrl, artifacts, packuments, 1);
+  const oldGenerationDirectory = join(siteDirectory, 'mirror', 'generations', oldGenerationId);
+  mkdirSync(oldGenerationDirectory, { recursive: true });
+  for (const file of packuments) writeFileSync(join(oldGenerationDirectory, file.path), file.bytes);
+  writeFileSync(join(oldGenerationDirectory, 'manifest.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    rendererVersion: 1,
+    publicBaseUrl,
+    generationId: oldGenerationId,
+    artifacts,
+  }, null, 2)}\n`);
+  unlinkSync(join(siteDirectory, 'mirror', 'current'));
+  symlinkSync(`generations/${oldGenerationId}`, join(siteDirectory, 'mirror', 'current'));
+
+  const upgraded = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  assert.equal(upgraded.noOp, false);
+  assert.equal(JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'manifest.json'), 'utf8')).rendererVersion, 2);
+  assert.equal(existsSync(oldGenerationDirectory), true);
+  const currentPackument = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'flatdemo'), 'utf8'));
+  assert.equal(currentPackument.versions['1.2.3'].dist.tarball, `https://deps.example.net/mirror/current/tarballs/${pkg.artifact.sha512}.tgz`);
+})));
+
+it.effect('publish rejects symbolic-link destination components', () => withScratch(directory => Effect.gen(function*() {
+  const stateDirectory = join(directory, 'state');
+  yield* saveState(stateDirectory, []);
 
   const destination = join(directory, 'destination');
   const alias = join(directory, 'alias');
   mkdirSync(destination);
   symlinkSync(destination, alias);
-  await assert.rejects(
+  yield* assertEffectRejects(
     publishSite(publishOptions(directory, stateDirectory, join(alias, 'site'))),
     /real directory/,
   );
   assert.deepEqual(readdirSync(destination), []);
-}));
+})));
 
-test('publish leaves current unchanged after validation, rename, and durability failures', async () => withScratch(async directory => {
+it.effect('publish leaves current unchanged after validation, rename, and durability failures', () => withScratch(directory => Effect.gen(function*() {
   const stateDirectory = join(directory, 'state');
   const siteDirectory = join(directory, 'site');
   const original = makePackage('flatdemo', '1.2.3');
   const addition = makePackage('next-package', '1.0.0');
-  await saveState(stateDirectory, [original]);
-  await publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  yield* saveState(stateDirectory, [original]);
+  yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   const originalTarget = currentTarget(siteDirectory);
 
-  await saveState(stateDirectory, [addition], 'next');
+  yield* saveState(stateDirectory, [addition], 'next');
   const badObject = join(stateDirectory, 'objects', 'sha512', `${addition.artifact.sha512}.tgz`);
   writeFileSync(badObject, Buffer.from('corrupt'));
-  await assert.rejects(publishSite(publishOptions(directory, stateDirectory, siteDirectory)), /SHA-512/);
+  yield* assertEffectRejects(publishSite(publishOptions(directory, stateDirectory, siteDirectory)), /SHA-512/);
   assert.equal(currentTarget(siteDirectory), originalTarget);
   writeFileSync(badObject, addition.bytes);
 
   const currentPath = join(siteDirectory, 'mirror', 'current');
   let failedGenerationSync = false;
   const generationsDirectory = join(siteDirectory, 'mirror', 'generations');
-  await assert.rejects(
+  yield* assertEffectRejects(
     publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
       syncDirectory: async path => {
         if (!failedGenerationSync && path.startsWith(join(generationsDirectory, '.mynpm-generation-'))) {
@@ -224,7 +293,7 @@ test('publish leaves current unchanged after validation, rename, and durability 
   assert.equal(failedGenerationSync, true);
   assert.equal(currentTarget(siteDirectory), originalTarget);
 
-  await assert.rejects(
+  yield* assertEffectRejects(
     publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
       rename: async (from, to) => {
         if (to === currentPath) throw Object.assign(new Error('injected rename failure'), { code: 'EIO' });
@@ -237,7 +306,7 @@ test('publish leaves current unchanged after validation, rename, and durability 
   assert.equal(currentTarget(siteDirectory), originalTarget);
 
   let failedCurrentSync = false;
-  await assert.rejects(
+  yield* assertEffectRejects(
     publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
       syncDirectory: async path => {
         if (path === join(siteDirectory, 'mirror') && !failedCurrentSync) {
@@ -252,40 +321,42 @@ test('publish leaves current unchanged after validation, rename, and durability 
     /durably switch/,
   );
   assert.equal(currentTarget(siteDirectory), originalTarget);
-}));
+})));
 
-test('concurrent publishers read inventory only after acquiring the publication lock', async () => withScratch(async directory => {
+it.effect('concurrent publishers read inventory only after acquiring the publication lock', () => withScratch(directory => Effect.gen(function*() {
   const stateDirectory = join(directory, 'state');
   const siteDirectory = join(directory, 'site');
   const first = makePackage('flatdemo', '1.2.3');
   const second = makePackage('other-package', '1.0.0');
-  await saveState(stateDirectory, [first]);
+  yield* saveState(stateDirectory, [first]);
   let markRead;
   let releaseRead;
   const readReached = new Promise(resolve => { markRead = resolve; });
   const readBarrier = new Promise(resolve => { releaseRead = resolve; });
   try {
-    const firstPublish = publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
+    const firstPublish = yield* Effect.forkChild(publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
       afterInventoryRead: async () => {
         markRead();
         await readBarrier;
       },
-    });
-    await readReached;
-    await saveState(stateDirectory, [second], 'next');
-    await assert.rejects(publishSite(publishOptions(directory, stateDirectory, siteDirectory)), error => error.category === 'conflict');
+    }));
+    yield* promiseEffect(() => readReached);
+    yield* saveState(stateDirectory, [second], 'next');
+    const conflict = yield* Effect.result(publishSite(publishOptions(directory, stateDirectory, siteDirectory)));
+    assert.equal(conflict._tag, 'Failure');
+    if (conflict._tag === 'Failure') assert.equal(conflict.failure.category, 'conflict');
     releaseRead();
-    await firstPublish;
-    const retry = await publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+    yield* Fiber.join(firstPublish);
+    const retry = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
     assert.equal(retry.packageCount, 2);
     const manifest = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'manifest.json'), 'utf8'));
     assert.deepEqual(manifest.artifacts.map(item => `${item.name}@${item.version}`), ['flatdemo@1.2.3', 'other-package@1.0.0']);
   } finally {
     releaseRead?.();
   }
-}));
+})));
 
-async function startStaticServer(siteDirectory) {
+function startStaticServer(siteDirectory) {
   const requests = [];
   const server = createServer(async (request, response) => {
     let pathname;
@@ -309,7 +380,7 @@ async function startStaticServer(siteDirectory) {
     }
     try {
       const bytes = readFileSync(sitePath);
-      const isMetadata = pathname.includes('/current/');
+      const isMetadata = pathname.includes('/current/') && !pathname.includes('/current/tarballs/');
       response.writeHead(200, {
         'Content-Type': isMetadata ? 'application/json' : 'application/octet-stream',
         'Cache-Control': isMetadata ? 'no-cache' : 'public, max-age=31536000, immutable',
@@ -319,19 +390,34 @@ async function startStaticServer(siteDirectory) {
     }
   });
   server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const address = server.address();
-  return { server, requests, port: address.port };
+  return promiseEffect(() => once(server, 'listening')).pipe(Effect.map(() => {
+    const address = server.address();
+    return { server, requests, port: address.port };
+  }));
 }
 
-async function requestJson(url) {
-  const response = await fetch(url);
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get('content-type'), /^application\/json/);
-  return response.json();
+function withStaticServer(siteDirectory, use) {
+  return Effect.acquireUseRelease(
+    startStaticServer(siteDirectory),
+    use,
+    ({ server }) => promiseEffect(() => new Promise((resolveServer, rejectServer) => {
+      server.closeAllConnections?.();
+      server.close(error => error ? rejectServer(error) : resolveServer());
+    })),
+  );
 }
 
-async function installWithPnpm(projectDirectory, registry, workspace, env) {
+function requestJson(url) {
+  return Effect.gen(function*() {
+    const response = yield* promiseEffect(() => fetch(url));
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type'), /^application\/json/);
+    return yield* promiseEffect(() => response.json());
+  });
+}
+
+function installWithPnpm(projectDirectory, registry, workspace, env) {
+  return Effect.gen(function*() {
   const manifest = {
     name: 'consumer-pnpm',
     version: '1.0.0',
@@ -341,27 +427,28 @@ async function installWithPnpm(projectDirectory, registry, workspace, env) {
   };
   writeFileSync(join(projectDirectory, 'package.json'), `${JSON.stringify(manifest)}\n`);
   const lockStore = join(workspace, 'lock-store');
-  await runProcess('pnpm', ['install', '--lockfile-only', `--registry=${registry}`, `--store-dir=${lockStore}`, '--ignore-scripts'], {
+  yield* runProcess('pnpm', ['install', '--lockfile-only', `--registry=${registry}`, `--store-dir=${lockStore}`, '--ignore-scripts'], {
     cwd: projectDirectory,
     env: { ...env, pnpm_config_store_dir: lockStore },
     timeoutMs: 240_000,
   });
   const frozenStore = join(workspace, 'frozen-store');
-  await runProcess('pnpm', ['install', '--frozen-lockfile', `--registry=${registry}`, `--store-dir=${frozenStore}`, '--ignore-scripts'], {
+  yield* runProcess('pnpm', ['install', '--frozen-lockfile', `--registry=${registry}`, `--store-dir=${frozenStore}`, '--ignore-scripts'], {
     cwd: projectDirectory,
     env: { ...env, pnpm_config_store_dir: frozenStore },
     timeoutMs: 240_000,
   });
-  await runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
+  yield* runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
     cwd: projectDirectory,
     env,
     timeoutMs: 30_000,
   });
   const lock = readFileSync(join(projectDirectory, 'pnpm-lock.yaml'), 'utf8');
   assert.doesNotMatch(lock, /registry\.npmjs\.org/);
+  });
 }
 
-test('published root and /mirror/ static URLs serve installable packages and immutable old tarballs', { timeout: 240_000 }, async testContext => withScratch(async directory => {
+it.effect('published root and /mirror/ static URLs serve installable packages and immutable old tarballs', () => withScratch(directory => Effect.gen(function*() {
   const stateDirectory = join(directory, 'state');
   const siteDirectory = join(directory, 'site');
   const flatdemo = makePackage('flatdemo', '1.2.3', { source: "module.exports = 'static registry works';\n" });
@@ -369,12 +456,8 @@ test('published root and /mirror/ static URLs serve installable packages and imm
     dependencies: { flatdemo: '1.2.3' },
     source: "module.exports = require('flatdemo') + ' (via @flatrepo/demo)';\n",
   });
-  await saveState(stateDirectory, [flatdemo, scoped]);
-  const staticSite = await startStaticServer(siteDirectory);
-  testContext.after(async () => {
-    staticSite.server.closeAllConnections?.();
-    await new Promise((resolveServer, rejectServer) => staticSite.server.close(error => error ? rejectServer(error) : resolveServer()));
-  });
+  yield* saveState(stateDirectory, [flatdemo, scoped]);
+  yield* withStaticServer(siteDirectory, staticSite => Effect.gen(function*() {
   const serverUrl = `http://127.0.0.1:${staticSite.port}`;
   const serverBase = `${serverUrl}/mirror/`;
   const envDirectory = join(directory, 'env');
@@ -395,53 +478,52 @@ test('published root and /mirror/ static URLs serve installable packages and imm
     npm_config_fund: 'false',
     pnpm_config_pm_on_fail: 'ignore',
   };
-  const npmVersion = await runProcess('npm', ['--version'], { cwd: directory, env, timeoutMs: 30_000 });
-  const remotePermission = npmVersion.stdout.trim().startsWith('12.') ? ['--allow-remote=all'] : [];
-  const prefixPublish = await publishSite(publishOptions(directory, stateDirectory, siteDirectory), { renderBaseUrl: serverBase });
+  const npmVersion = yield* runProcess('npm', ['--version'], { cwd: directory, env, timeoutMs: 30_000 });
+  const prefixPublish = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory), { renderBaseUrl: serverBase });
   assert.equal(prefixPublish.packageCount, 2);
   const oldPackumentUrl = `${serverBase}current/flatdemo`;
-  const oldPackument = await requestJson(oldPackumentUrl);
-  await requestJson(`${serverBase}current/@flatrepo%2fdemo`);
-  const uppercaseScopedRoute = await fetch(`${serverBase}current/@flatrepo%2Fdemo`);
+  const oldPackument = yield* requestJson(oldPackumentUrl);
+  yield* requestJson(`${serverBase}current/@flatrepo%2fdemo`);
+  const uppercaseScopedRoute = yield* promiseEffect(() => fetch(`${serverBase}current/@flatrepo%2Fdemo`));
   assert.equal(uppercaseScopedRoute.status, 200);
   assert.match(uppercaseScopedRoute.headers.get('content-type'), /^application\/json/);
-  await uppercaseScopedRoute.arrayBuffer();
-  const missingPackage = await fetch(`${serverBase}current/missing-package`);
+  yield* promiseEffect(() => uppercaseScopedRoute.arrayBuffer());
+  const missingPackage = yield* promiseEffect(() => fetch(`${serverBase}current/missing-package`));
   assert.equal(missingPackage.status, 404);
-  await missingPackage.arrayBuffer();
+  yield* promiseEffect(() => missingPackage.arrayBuffer());
   const oldTarballUrl = oldPackument.versions['1.2.3'].dist.tarball;
 
   const prefixProject = join(directory, 'prefix-project');
   mkdirSync(prefixProject);
   writeFileSync(join(prefixProject, 'package.json'), '{"name":"consumer-prefix","version":"1.0.0","private":true}\n');
   const prefixCache = join(directory, 'prefix-cache');
-  await runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${serverBase}current/`, `--cache=${prefixCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0', ...remotePermission], {
+  yield* runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${serverBase}current/`, `--cache=${prefixCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
     cwd: prefixProject,
     env: { ...env, npm_config_cache: prefixCache },
     timeoutMs: 240_000,
   });
-  const prefixResult = await runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
+  const prefixResult = yield* runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
     cwd: prefixProject,
     env,
     timeoutMs: 30_000,
   });
   assert.equal(prefixResult.stderr, '');
-  const pnpmVersionResult = await runProcess('pnpm', ['--version'], { cwd: directory, env, timeoutMs: 30_000 }).catch(() => null);
-  const pnpmVersion = pnpmVersionResult?.stdout.trim().split(/\s+/)[0] ?? 'unavailable';
+  const pnpmVersionResult = yield* Effect.result(runProcess('pnpm', ['--version'], { cwd: directory, env, timeoutMs: 30_000 }));
+  const pnpmVersion = pnpmVersionResult._tag === 'Success' ? pnpmVersionResult.success.stdout.trim().split(/\s+/)[0] : 'unavailable';
   if (process.version === 'v24.22.0' && pnpmVersion === '12.15.0') {
     const prefixPnpmProject = join(directory, 'prefix-pnpm-project');
     mkdirSync(prefixPnpmProject);
-    await installWithPnpm(prefixPnpmProject, `${serverBase}current/`, join(directory, 'prefix-pnpm'), env);
+    yield* installWithPnpm(prefixPnpmProject, `${serverBase}current/`, join(directory, 'prefix-pnpm'), env);
   } else {
-    testContext.diagnostic(`pnpm 12.15.0 proof skipped; found Node ${process.version}, pnpm ${pnpmVersion}`);
+    console.info(`pnpm 12.15.0 proof skipped; found Node ${process.version}, pnpm ${pnpmVersion}`);
   }
 
   const rootBase = `${serverUrl}/`;
-  const rootPublish = await publishSite(publishOptions(directory, stateDirectory, siteDirectory), { renderBaseUrl: rootBase });
+  const rootPublish = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory), { renderBaseUrl: rootBase });
   assert.notEqual(rootPublish.generationId, prefixPublish.generationId);
-  const oldTarballResponse = await fetch(oldTarballUrl);
+  const oldTarballResponse = yield* promiseEffect(() => fetch(oldTarballUrl));
   assert.equal(oldTarballResponse.status, 200);
-  assert.deepEqual(Buffer.from(await oldTarballResponse.arrayBuffer()), flatdemo.bytes);
+  assert.deepEqual(Buffer.from(yield* promiseEffect(() => oldTarballResponse.arrayBuffer())), flatdemo.bytes);
   const oldTarballHeader = oldTarballResponse.headers.get('content-type');
   assert.match(oldTarballHeader, /application\/octet-stream/);
 
@@ -449,12 +531,12 @@ test('published root and /mirror/ static URLs serve installable packages and imm
   mkdirSync(rootProject);
   writeFileSync(join(rootProject, 'package.json'), '{"name":"consumer-root","version":"1.0.0","private":true}\n');
   const rootCache = join(directory, 'root-cache');
-  await runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${rootBase}current/`, `--cache=${rootCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0', ...remotePermission], {
+  yield* runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${rootBase}current/`, `--cache=${rootCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
     cwd: rootProject,
     env: { ...env, npm_config_cache: rootCache },
     timeoutMs: 240_000,
   });
-  await runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
+  yield* runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
     cwd: rootProject,
     env,
     timeoutMs: 30_000,
@@ -462,24 +544,25 @@ test('published root and /mirror/ static URLs serve installable packages and imm
   if (process.version === 'v24.22.0' && pnpmVersion === '12.15.0') {
     const rootPnpmProject = join(directory, 'root-pnpm-project');
     mkdirSync(rootPnpmProject);
-    await installWithPnpm(rootPnpmProject, `${rootBase}current/`, join(directory, 'root-pnpm'), env);
+    yield* installWithPnpm(rootPnpmProject, `${rootBase}current/`, join(directory, 'root-pnpm'), env);
   }
-  await runProcess('npm', ['ci', `--registry=${rootBase}current/`, `--cache=${join(directory, 'root-ci-cache')}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0', ...remotePermission], {
+  yield* runProcess('npm', ['ci', `--registry=${rootBase}current/`, `--cache=${join(directory, 'root-ci-cache')}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
     cwd: rootProject,
     env: { ...env, npm_config_cache: join(directory, 'root-ci-cache') },
     timeoutMs: 240_000,
   });
-  await runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
+  yield* runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
     cwd: rootProject,
     env,
     timeoutMs: 30_000,
   });
 
   const lock = JSON.parse(readFileSync(join(rootProject, 'package-lock.json'), 'utf8'));
-  assert.equal(lock.packages['node_modules/flatdemo'].resolved, `${rootBase}tarballs/${flatdemo.artifact.sha512}.tgz`);
-  assert.equal(lock.packages['node_modules/@flatrepo/demo'].resolved, `${rootBase}tarballs/${scoped.artifact.sha512}.tgz`);
+  assert.equal(lock.packages['node_modules/flatdemo'].resolved, `${rootBase}current/tarballs/${flatdemo.artifact.sha512}.tgz`);
+  assert.equal(lock.packages['node_modules/@flatrepo/demo'].resolved, `${rootBase}current/tarballs/${scoped.artifact.sha512}.tgz`);
   assert.equal(staticSite.requests.some(path => path === '/mirror/current/@flatrepo/demo'), true);
   assert.equal(staticSite.requests.some(path => path === '/current/@flatrepo/demo'), true);
   assert.equal(staticSite.requests.every(path => path.startsWith('/mirror/current/') || path.startsWith('/mirror/tarballs/') || path.startsWith('/current/') || path.startsWith('/tarballs/')), true);
   assert.match(npmVersion.stdout.trim(), /^\d+\.\d+\.\d+/);
-}));
+  }));
+})), 240_000);

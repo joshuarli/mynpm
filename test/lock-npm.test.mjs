@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { test } from 'node:test';
-import { parseNpmLock } from '../src/lock-npm.mjs';
+import { test } from 'vitest';
+import { parseNpmLock } from '../src/lock-npm.ts';
 
 const lockPath = new URL('./fixtures/locks/package-lock-v3.json', import.meta.url);
 const v3Lock = JSON.parse(readFileSync(lockPath, 'utf8'));
@@ -25,7 +25,7 @@ test('npm v2 and v3 lockfiles preserve nested, scoped, and aliased identities', 
   assert.equal(v2.packages[0].name, 'flatdemo');
   assert.equal(v3.packages.find(pkg => pkg.key === 'node_modules/catalog-alias').name, 'real-package');
   assert.equal(v3.packages.find(pkg => pkg.key === 'node_modules/catalog-alias').aliases[0], 'catalog-alias');
-  assert.deepEqual(v3.packages.filter(pkg => pkg.name === 'nested').map(pkg => pkg.version).sort(), ['1.0.4', '2.1.0']);
+  assert.deepEqual(v3.packages.filter(pkg => pkg.name === 'nested').map(pkg => pkg.version).sort((left, right) => left.localeCompare(right)), ['1.0.4', '2.1.0']);
   assert.equal(v3.packages.find(pkg => pkg.name === '@scope/direct').version, '2.0.1');
 });
 
@@ -64,7 +64,9 @@ test('npm non-registry sources receive explicit classifications', () => {
   const packages = parse().packages;
   const kind = name => packages.find(pkg => pkg.name === name).sourceKind;
 
-  assert.equal(kind('workspace-link'), 'local');
+  const workspaceLink = packages.find(pkg => pkg.key === 'node_modules/workspace-link');
+  assert.equal(workspaceLink.sourceKind, 'local');
+  assert.deepEqual(workspaceLink.aliases, ['workspace-link']);
   assert.equal(kind('local-file'), 'local');
   assert.equal(kind('git-source'), 'git');
   assert.equal(kind('github-source'), 'git');

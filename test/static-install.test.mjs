@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { test } from 'node:test';
+import { test } from 'vitest';
 import { fileURLToPath } from 'node:url';
 
 const fixtureRoot = fileURLToPath(new URL('./fixtures/protocol-seed/', import.meta.url));

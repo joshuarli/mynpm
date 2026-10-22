@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { limits } from '../src/limits.mjs';
+import { test } from 'vitest';
+import { limits } from '../src/limits.ts';
 
 test('acquisition limits match the approved fixed policy', () => {
   assert.deepEqual(limits, {

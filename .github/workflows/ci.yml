@@ -26,6 +26,10 @@ jobs:
         with:
           node-version: 22.16.0
           package-manager-cache: false
+      - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
+        with:
+          version: 12.15.0
+          install: false
       - name: Check pinned compatibility toolchain
         run: |
           test "$(node --version)" = "v22.16.0"
@@ -36,16 +40,15 @@ jobs:
             printf '\n.work/\n' >> .git/info/exclude
           fi
           mkdir -p "$GITHUB_WORKSPACE/.work/tmp"
-      - name: Install locked parser dependency
+      - name: Install locked dependencies
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
-          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
-        run: npm ci --ignore-scripts --no-audit --no-fund
+        run: pnpm install --frozen-lockfile --ignore-scripts --store-dir .work/pnpm-store
       - name: Run offline suite
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
           npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
-        run: npm test
+        run: pnpm check
 
   static-clients:
     strategy:
@@ -73,7 +76,6 @@ jobs:
       - name: Install pinned npm
         run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
       - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
-        if: matrix.client == 'pnpm'
         with:
           version: 12.15.0
           install: false
@@ -91,16 +93,15 @@ jobs:
             printf '\n.work/\n' >> .git/info/exclude
           fi
           mkdir -p "$GITHUB_WORKSPACE/.work/tmp"
-      - name: Install locked parser dependency
+      - name: Install locked dependencies
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
-          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
-        run: npm ci --ignore-scripts --no-audit --no-fund
+        run: pnpm install --frozen-lockfile --ignore-scripts --store-dir .work/pnpm-store
       - name: Exercise pinned static clients
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
           npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
-        run: node --test test/publish.test.mjs test/validate.test.mjs
+        run: pnpm exec vitest run test/publish.test.mjs test/validate.test.mjs
 
   public-smoke:
     if: github.event_name == 'workflow_dispatch' && inputs.public_smoke == true
@@ -131,20 +132,19 @@ jobs:
             printf '\n.work/\n' >> .git/info/exclude
           fi
           mkdir -p "$GITHUB_WORKSPACE/.work/tmp"
-      - name: Install locked parser dependency
+      - name: Install locked dependencies
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
-          npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
-        run: npm ci --ignore-scripts --no-audit --no-fund
+        run: pnpm install --frozen-lockfile --ignore-scripts --store-dir .work/pnpm-store
       - name: Resolve, fetch, verify, and validate the pinned public closure
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
           npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
         run: |
-          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state add typescript@5.9.3 esbuild@0.28.2 --manager npm
-          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state add typescript@5.9.3 esbuild@0.28.2 --manager pnpm
-          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state fetch
-          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state verify
-          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state publish --site-dir .work/smoke-site
-          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state validate --client npm
-          node src/cli.mjs --config test/fixtures/mynpm.json --state-dir .work/smoke-state validate --client pnpm
+          node --experimental-strip-types src/cli.ts --config test/fixtures/mynpm.json --state-dir .work/smoke-state add typescript@5.9.3 esbuild@0.28.2 --manager npm
+          node --experimental-strip-types src/cli.ts --config test/fixtures/mynpm.json --state-dir .work/smoke-state add typescript@5.9.3 esbuild@0.28.2 --manager pnpm
+          node --experimental-strip-types src/cli.ts --config test/fixtures/mynpm.json --state-dir .work/smoke-state fetch
+          node --experimental-strip-types src/cli.ts --config test/fixtures/mynpm.json --state-dir .work/smoke-state verify
+          node --experimental-strip-types src/cli.ts --config test/fixtures/mynpm.json --state-dir .work/smoke-state publish --site-dir .work/smoke-site
+          node --experimental-strip-types src/cli.ts --config test/fixtures/mynpm.json --state-dir .work/smoke-state validate --client npm
+          node --experimental-strip-types src/cli.ts --config test/fixtures/mynpm.json --state-dir .work/smoke-state validate --client pnpm
