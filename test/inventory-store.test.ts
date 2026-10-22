@@ -1,24 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { it } from '@effect/vitest';
 import { Effect, Fiber } from 'effect';
-import { fileURLToPath } from 'node:url';
 import { createEmptyInventory } from '../src/inventory.ts';
 import { loadInventory, saveInventory, updateInventory } from '../src/inventory-store.ts';
-
-const scratchRoot = fileURLToPath(new URL('../.work/tmp/', import.meta.url));
-
-function withScratch(prefix, run) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      mkdirSync(scratchRoot, { recursive: true });
-      return mkdtempSync(join(scratchRoot, prefix));
-    }),
-    run,
-    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
-  );
-}
+import { withScratch } from './support.ts';
 
 it.effect('missing inventory reads as empty without creating state', () => withScratch('inventory-read-', directory => Effect.gen(function*() {
   assert.deepEqual(yield* loadInventory(directory), createEmptyInventory());
@@ -40,10 +27,10 @@ it.effect('inventory reads and writes reject symbolic-link files without followi
 })));
 
 it.effect('inventory updates reject a concurrent writer and release the lock on completion', () => withScratch('inventory-lock-', directory => Effect.gen(function*() {
-  let startUpdate;
-  let releaseUpdate;
-  const started = new Promise(resolve => { startUpdate = resolve; });
-  const barrier = new Promise(resolve => { releaseUpdate = resolve; });
+  let startUpdate = () => {};
+  let releaseUpdate = () => {};
+  const started = new Promise<void>(resolve => { startUpdate = resolve; });
+  const barrier = new Promise<void>(resolve => { releaseUpdate = resolve; });
   const first = yield* Effect.forkChild(updateInventory(directory, async inventory => {
     startUpdate();
     await barrier;

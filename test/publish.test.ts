@@ -1,27 +1,44 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import type { Server } from 'node:http';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import { join, relative, resolve } from 'node:path';
 import { once } from 'node:events';
 import { it } from '@effect/vitest';
 import { Effect, Fiber } from 'effect';
+import type * as Scope from 'effect/Scope';
 import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.ts';
+import { MynpmError } from '../src/errors.ts';
 import { createEmptyInventory, mergeProject, recordVerifiedArtifact } from '../src/inventory.ts';
+import type { ArtifactRecord, ArtifactVerification, Inventory, PackumentMetadata } from '../src/inventory.ts';
 import { parseNpmLock } from '../src/lock-npm.ts';
 import { publishSite } from '../src/publish.ts';
 import { renderPackumentFiles } from '../src/packument.ts';
+import type { PackumentFile } from '../src/packument.ts';
 import { saveInventory } from '../src/inventory-store.ts';
 import { runProcess } from '../src/process.ts';
+import { withScratch } from './support.ts';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const workDirectory = join(repositoryRoot, '.work');
 const scratchRoot = join(workDirectory, 'tmp');
 const config = parseConfig(readFileSync(new URL('./fixtures/mynpm.json', import.meta.url), 'utf8'));
+type TestPackage = {
+  name: string;
+  version: string;
+  bytes: Buffer;
+  metadata: { name: string; version: string; dependencies: Record<string, string>; dist: { tarball: string; integrity: string; shasum: string } };
+  packument: PackumentMetadata;
+  artifact: ArtifactVerification;
+};
+type PackageTarOptions = { name: string; version: string; main?: string; dependencies?: Record<string, string>; source?: string };
+type PublishOptions = Parameters<typeof publishSite>[0];
+type StaticSite = { server: Server; requests: string[]; port: number };
 
-function tarMember(name, content) {
+function tarMember(name: string, content: Buffer): Buffer {
   const header = Buffer.alloc(512);
   header.write(name, 0, 100, 'utf8');
   header.write('0000644\0', 100, 8, 'ascii');
@@ -39,7 +56,7 @@ function tarMember(name, content) {
   return Buffer.concat([header, padded]);
 }
 
-function packageTar({ name, version, main = 'index.js', dependencies = {}, source = 'module.exports = true;\n' }) {
+function packageTar({ name, version, main = 'index.js', dependencies = {}, source = 'module.exports = true;\n' }: PackageTarOptions): Buffer {
   const manifest = Buffer.from(JSON.stringify({ name, version, main, dependencies, license: 'MIT' }));
   return gzipSync(Buffer.concat([
     tarMember('package/package.json', manifest),
@@ -48,7 +65,7 @@ function packageTar({ name, version, main = 'index.js', dependencies = {}, sourc
   ]));
 }
 
-function makePackage(name, version, options = {}) {
+function makePackage(name: string, version: string, options: { bytes?: Buffer; dependencies?: Record<string, string>; source?: string } = {}): TestPackage {
   const bytes = options.bytes ?? packageTar({ name, version, dependencies: options.dependencies, source: options.source });
   const sha512 = createHash('sha512').update(bytes).digest('hex');
   const shasum = createHash('sha1').update(bytes).digest('hex');
@@ -86,8 +103,8 @@ function makePackage(name, version, options = {}) {
   };
 }
 
-function makeInventory(packages, projectId = 'app') {
-  const lockPackages = { '': { dependencies: Object.fromEntries(packages.map(pkg => [pkg.name, pkg.version])) } };
+function makeInventory(packages: TestPackage[], projectId = 'app'): Inventory {
+  const lockPackages: Record<string, unknown> = { '': { dependencies: Object.fromEntries(packages.map(pkg => [pkg.name, pkg.version])) } };
   for (const pkg of packages) {
     lockPackages[`node_modules/${pkg.name}`] = {
       version: pkg.version,
@@ -109,7 +126,7 @@ function makeInventory(packages, projectId = 'app') {
   }), mergeProject(createEmptyInventory(), project));
 }
 
-function saveState(stateDirectory, packages, projectId = 'app') {
+function saveState(stateDirectory: string, packages: TestPackage[], projectId = 'app'): Effect.Effect<void, MynpmError> {
   return Effect.gen(function*() {
     yield* saveInventory(stateDirectory, makeInventory(packages, projectId));
     for (const pkg of packages) {
@@ -120,38 +137,33 @@ function saveState(stateDirectory, packages, projectId = 'app') {
   });
 }
 
-function withScratch(run) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      mkdirSync(scratchRoot, { recursive: true });
-      return mkdtempSync(join(scratchRoot, 'publish-'));
-    }),
-    run,
-    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
-  );
+function promiseEffect<A>(operation: () => PromiseLike<A>): Effect.Effect<A, MynpmError> {
+  return Effect.tryPromise({ try: operation, catch: cause => new MynpmError('operation', 'test operation failed', { cause }) });
 }
 
-function promiseEffect(operation) {
-  return Effect.tryPromise({ try: operation, catch: cause => cause });
-}
-
-function assertEffectRejects(effect, expected) {
+function assertEffectRejects(effect: Effect.Effect<unknown, unknown>, expected: RegExp): Effect.Effect<void> {
   return Effect.gen(function*() {
     const outcome = yield* Effect.result(effect);
     assert.equal(outcome._tag, 'Failure');
-    if (outcome._tag === 'Failure') assert.match(outcome.failure.message, expected);
+    if (outcome._tag === 'Failure') {
+      assert.ok(outcome.failure instanceof Error);
+      assert.match(outcome.failure.message, expected);
+    }
   });
 }
 
-function assertFailureCategory(effect, category) {
+function assertFailureCategory(effect: Effect.Effect<unknown, unknown>, category: string): Effect.Effect<void> {
   return Effect.gen(function*() {
     const outcome = yield* Effect.result(effect);
     assert.equal(outcome._tag, 'Failure');
-    if (outcome._tag === 'Failure') assert.equal(outcome.failure.category, category);
+    if (outcome._tag === 'Failure') {
+      assert.ok(outcome.failure instanceof MynpmError);
+      assert.equal(outcome.failure.category, category);
+    }
   });
 }
 
-function publishOptions(directory, stateDirectory, siteDirectory, overrides = {}) {
+function publishOptions(_directory: string, stateDirectory: string, siteDirectory: string, overrides: Partial<PublishOptions> = {}): PublishOptions {
   return {
     stateDirectory,
     siteDirectory,
@@ -160,17 +172,18 @@ function publishOptions(directory, stateDirectory, siteDirectory, overrides = {}
   };
 }
 
-function currentTarget(siteDirectory) {
+function currentTarget(siteDirectory: string): string {
   return readlinkSync(join(siteDirectory, 'mirror', 'current'));
 }
 
-function canonicalValue(value) {
+function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
   if (value === null || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalValue(value[key])]));
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(Object.keys(record).sort().map(key => [key, canonicalValue(record[key])]));
 }
 
-function generationId(publicBaseUrl, artifacts, packuments, rendererVersion) {
+function generationId(publicBaseUrl: string, artifacts: ArtifactRecord[], packuments: PackumentFile[], rendererVersion: number): string {
   const payload = {
     schemaVersion: 1,
     rendererVersion,
@@ -334,10 +347,10 @@ it.effect('publish keeps the current generation active until shared tarballs are
   const originalTarget = currentTarget(siteDirectory);
   yield* saveState(stateDirectory, [addition], 'next');
 
-  let markTarball;
-  let releaseTarball;
-  const tarballReached = new Promise(resolve => { markTarball = resolve; });
-  const tarballBarrier = new Promise(resolve => { releaseTarball = resolve; });
+  let markTarball = () => {};
+  let releaseTarball = () => {};
+  const tarballReached = new Promise<void>(resolve => { markTarball = resolve; });
+  const tarballBarrier = new Promise<void>(resolve => { releaseTarball = resolve; });
   try {
     const publish = yield* Effect.forkChild(publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
       link: async (source, destination) => {
@@ -448,10 +461,10 @@ it.effect('concurrent publishers read inventory only after acquiring the publica
   const first = makePackage('flatdemo', '1.2.3');
   const second = makePackage('other-package', '1.0.0');
   yield* saveState(stateDirectory, [first]);
-  let markRead;
-  let releaseRead;
-  const readReached = new Promise(resolve => { markRead = resolve; });
-  const readBarrier = new Promise(resolve => { releaseRead = resolve; });
+  let markRead = () => {};
+  let releaseRead = () => {};
+  const readReached = new Promise<void>(resolve => { markRead = resolve; });
+  const readBarrier = new Promise<void>(resolve => { releaseRead = resolve; });
   try {
     const firstPublish = yield* Effect.forkChild(publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
       afterInventoryRead: async () => {
@@ -468,19 +481,19 @@ it.effect('concurrent publishers read inventory only after acquiring the publica
     yield* Fiber.join(firstPublish);
     const retry = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
     assert.equal(retry.packageCount, 2);
-    const manifest = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'manifest.json'), 'utf8'));
+    const manifest = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'manifest.json'), 'utf8')) as { artifacts: Array<{ name: string; version: string }> };
     assert.deepEqual(manifest.artifacts.map(item => `${item.name}@${item.version}`), ['flatdemo@1.2.3', 'other-package@1.0.0']);
   } finally {
     releaseRead?.();
   }
 })));
 
-function startStaticServer(siteDirectory) {
-  const requests = [];
+function startStaticServer(siteDirectory: string): Effect.Effect<StaticSite, MynpmError> {
+  const requests: string[] = [];
   const server = createServer(async (request, response) => {
     let pathname;
     try {
-      pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
+      pathname = decodeURIComponent(new URL(request.url ?? '/', 'http://localhost').pathname);
     } catch {
       response.writeHead(400).end();
       return;
@@ -505,37 +518,41 @@ function startStaticServer(siteDirectory) {
         'Cache-Control': isMetadata ? 'no-cache' : 'public, max-age=31536000, immutable',
       }).end(bytes);
     } catch (cause) {
-      response.writeHead(cause.code === 'ENOENT' ? 404 : 500).end();
+      const code = typeof cause === 'object' && cause !== null && 'code' in cause ? cause.code : undefined;
+      response.writeHead(code === 'ENOENT' ? 404 : 500).end();
     }
   });
   server.listen(0, '127.0.0.1');
   return promiseEffect(() => once(server, 'listening')).pipe(Effect.map(() => {
     const address = server.address();
+    assert.ok(address !== null && typeof address !== 'string');
     return { server, requests, port: address.port };
   }));
 }
 
-function withStaticServer(siteDirectory, use) {
+function withStaticServer<A, E>(siteDirectory: string, use: (staticSite: StaticSite) => Effect.Effect<A, E, Scope.Scope>): Effect.Effect<A, E | MynpmError, Scope.Scope> {
   return Effect.acquireUseRelease(
     startStaticServer(siteDirectory),
     use,
-    ({ server }) => promiseEffect(() => new Promise((resolveServer, rejectServer) => {
+    ({ server }) => promiseEffect(() => new Promise<void>((resolveServer, rejectServer) => {
       server.closeAllConnections?.();
       server.close(error => error ? rejectServer(error) : resolveServer());
     })),
   );
 }
 
-function requestJson(url) {
+function requestJson(url: string | URL): Effect.Effect<unknown, MynpmError> {
   return Effect.gen(function*() {
     const response = yield* promiseEffect(() => fetch(url));
     assert.equal(response.status, 200);
-    assert.match(response.headers.get('content-type'), /^application\/json/);
+    const contentType = response.headers.get('content-type');
+    assert.ok(contentType);
+    assert.match(contentType, /^application\/json/);
     return yield* promiseEffect(() => response.json());
   });
 }
 
-function installWithPnpm(projectDirectory, registry, workspace, env) {
+function installWithPnpm(projectDirectory: string, registry: string, workspace: string, env: NodeJS.ProcessEnv): Effect.Effect<void, MynpmError> {
   return Effect.gen(function*() {
   const manifest = {
     name: 'consumer-pnpm',
@@ -601,11 +618,13 @@ it.effect('published root and /mirror/ static URLs serve installable packages an
   const prefixPublish = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory), { renderBaseUrl: serverBase });
   assert.equal(prefixPublish.packageCount, 2);
   const oldPackumentUrl = `${serverBase}current/flatdemo`;
-  const oldPackument = yield* requestJson(oldPackumentUrl);
+  const oldPackument = (yield* requestJson(oldPackumentUrl)) as { versions: Record<string, { dist: { tarball: string } }> };
   yield* requestJson(`${serverBase}current/@flatrepo%2fdemo`);
   const uppercaseScopedRoute = yield* promiseEffect(() => fetch(`${serverBase}current/@flatrepo%2Fdemo`));
   assert.equal(uppercaseScopedRoute.status, 200);
-  assert.match(uppercaseScopedRoute.headers.get('content-type'), /^application\/json/);
+  const scopedContentType = uppercaseScopedRoute.headers.get('content-type');
+  assert.ok(scopedContentType);
+  assert.match(scopedContentType, /^application\/json/);
   yield* promiseEffect(() => uppercaseScopedRoute.arrayBuffer());
   const missingPackage = yield* promiseEffect(() => fetch(`${serverBase}current/missing-package`));
   assert.equal(missingPackage.status, 404);
@@ -646,6 +665,7 @@ it.effect('published root and /mirror/ static URLs serve installable packages an
   assert.equal(oldTarballResponse.status, 200);
   assert.deepEqual(Buffer.from(yield* promiseEffect(() => oldTarballResponse.arrayBuffer())), flatdemo.bytes);
   const oldTarballHeader = oldTarballResponse.headers.get('content-type');
+  assert.ok(oldTarballHeader);
   assert.match(oldTarballHeader, /application\/octet-stream/);
 
   const rootProject = join(directory, 'root-project');

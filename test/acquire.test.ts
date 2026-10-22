@@ -1,24 +1,28 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import type { IncomingHttpHeaders } from 'node:http';
+import type { LookupAddress } from 'node:dns';
 import { gzipSync } from 'node:zlib';
 import { Readable } from 'node:stream';
 import { it } from '@effect/vitest';
 import { Deferred, Effect, Fiber } from 'effect';
-import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.ts';
 import { createEmptyInventory, mergeProject } from '../src/inventory.ts';
+import type { Inventory } from '../src/inventory.ts';
 import { parseNpmLock } from '../src/lock-npm.ts';
 import { loadInventory, saveInventory } from '../src/inventory-store.ts';
 import { fetchInventory, verifyInventory } from '../src/acquire.ts';
 import { limits } from '../src/limits.ts';
+import { withScratch } from './support.ts';
 
-const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
-const scratchRoot = join(repositoryRoot, '.work', 'tmp');
 const config = parseConfig(readFileSync(new URL('./fixtures/mynpm.json', import.meta.url), 'utf8'));
+type FetchDependencies = NonNullable<Parameters<typeof fetchInventory>[1]>;
+type RequiredFetchDependencies = Required<FetchDependencies>;
+type TestPackage = { name: string; version: string; bytes: Buffer; metadata: ReturnType<typeof packageMetadata> };
 
-function tarMember(name, content) {
+function tarMember(name: string, content: Buffer): Buffer {
   const header = Buffer.alloc(512);
   header.write(name, 0, 100, 'utf8');
   header.write('0000644\0', 100, 8, 'ascii');
@@ -36,7 +40,7 @@ function tarMember(name, content) {
   return Buffer.concat([header, padded]);
 }
 
-function packageTar(name, version) {
+function packageTar(name: string, version: string): Buffer {
   const manifest = Buffer.from(JSON.stringify({ name, version, main: 'index.js' }));
   const source = Buffer.from('module.exports = true;\n');
   return gzipSync(Buffer.concat([
@@ -46,7 +50,7 @@ function packageTar(name, version) {
   ]));
 }
 
-function packageMetadata(name, version, bytes, { sha512 = true, shasum = true, tarballUrl } = {}) {
+function packageMetadata(name: string, version: string, bytes: Buffer, { sha512 = true, shasum = true, tarballUrl }: { sha512?: boolean; shasum?: boolean; tarballUrl?: string } = {}) {
   return {
     name,
     version,
@@ -60,7 +64,11 @@ function packageMetadata(name, version, bytes, { sha512 = true, shasum = true, t
   };
 }
 
-function makeInventory(packages, { integrity = true } = {}) {
+function testPackage(name: string, version: string, bytes: Buffer, options?: Parameters<typeof packageMetadata>[3]): TestPackage {
+  return { name, version, bytes, metadata: packageMetadata(name, version, bytes, options) };
+}
+
+function makeInventory(packages: TestPackage[], { integrity = true }: { integrity?: boolean } = {}): Inventory {
   return packages.reduce((inventory, { name, version, bytes }, index) => {
     const lock = {
       name: `project-${index}`,
@@ -83,49 +91,39 @@ function makeInventory(packages, { integrity = true } = {}) {
   }, createEmptyInventory());
 }
 
-function response(statusCode, body, headers = {}) {
+function response(statusCode: number, body: string | Uint8Array, headers: IncomingHttpHeaders = {}) {
   const bytes = Buffer.isBuffer(body) ? body : Buffer.from(body);
   return { statusCode, headers: { 'content-length': String(bytes.length), ...headers }, body: Readable.from([bytes]), close() {} };
 }
 
-function withScratch(run) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      mkdirSync(scratchRoot, { recursive: true });
-      return mkdtempSync(join(scratchRoot, 'acquire-'));
-    }),
-    run,
-    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
-  );
-}
-
-function dependenciesFor(packages, overrides = {}) {
+function dependenciesFor(packages: TestPackage[], overrides: Partial<RequiredFetchDependencies> = {}): RequiredFetchDependencies {
   const metadata = new Map(packages.map(pkg => [new URL(pkg.name.startsWith('@') ? `${pkg.name.slice(0, pkg.name.indexOf('/'))}%2f${pkg.name.slice(pkg.name.indexOf('/') + 1)}` : pkg.name, config.upstreamRegistry).href, pkg.metadata]));
   const artifacts = new Map(packages.map(pkg => [pkg.metadata.dist.tarball, pkg.bytes]));
-  return {
-    resolveAddresses: async () => [{ address: '8.8.8.8', family: 4 }],
-    exchange: async url => {
-      if (metadata.has(url.href)) {
-        const version = metadata.get(url.href).version;
+  return Object.assign({
+    resolveAddresses: (async () => [{ address: '8.8.8.8', family: 4 } satisfies LookupAddress]) as unknown as RequiredFetchDependencies['resolveAddresses'],
+    exchange: async (url: URL, _options: Parameters<RequiredFetchDependencies['exchange']>[1]) => {
+      const selected = metadata.get(url.href);
+      if (selected !== undefined) {
+        const version = selected.version;
         return response(200, JSON.stringify({
-          name: metadata.get(url.href).name,
+          name: selected.name,
           'dist-tags': { latest: version },
           time: { [version]: '2026-01-01T00:00:00.000Z' },
-          versions: { [version]: metadata.get(url.href) },
+          versions: { [version]: selected },
         }));
       }
       const artifact = artifacts.get(url.href);
       if (!artifact) return response(404, 'missing');
       return response(200, artifact);
     },
-    ...overrides,
-  };
+    scheduleTimeout: setTimeout,
+    clearScheduledTimeout: clearTimeout,
+  }, overrides);
 }
 
 it.effect('fetch verifies, stores and records one artifact; repeated fetch reuses it and verify detects corruption', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('flatdemo', '1.2.3', bytes);
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const dependencies = dependenciesFor([pkg]);
@@ -150,10 +148,10 @@ it.effect('fetch verifies, stores and records one artifact; repeated fetch reuse
   assert.equal((yield* verifyInventory({ stateDirectory, config })).verifiedCount, 1);
   assert.deepEqual(readFileSync(join(stateDirectory, 'inventory.json')), inventoryBytes);
   unlinkSync(objectPath);
-  const retryUrls = [];
+  const retryUrls: string[] = [];
   const recovered = yield* fetchInventory({ stateDirectory, config }, {
     ...dependencies,
-    exchange: async (url, options) => {
+    exchange: async (url: URL, options: Parameters<RequiredFetchDependencies['exchange']>[1]) => {
       retryUrls.push(url.href);
       return dependencies.exchange(url, options);
     },
@@ -175,8 +173,7 @@ it.effect('fetch verifies, stores and records one artifact; repeated fetch reuse
 it.effect('fetch rejects corrupt bytes and a tarball whose package manifest has another identity', () => withScratch(directory => Effect.gen(function*() {
   const expected = packageTar('flatdemo', '1.2.3');
   const wrongIdentity = packageTar('other', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes: expected };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, expected);
+  const pkg = testPackage('flatdemo', '1.2.3', expected);
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg], { integrity: false }));
   const corrupt = dependenciesFor([{ ...pkg, bytes: Buffer.from('corrupt') }]);
@@ -195,8 +192,7 @@ it.effect('fetch rejects corrupt bytes and a tarball whose package manifest has 
 
 it.effect('SHA-1-only artifacts require the explicit legacy policy and never reach storage on rejection', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('legacy', '1.0.0');
-  const pkg = { name: 'legacy', version: '1.0.0', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes, { sha512: false });
+  const pkg = testPackage('legacy', '1.0.0', bytes, { sha512: false });
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg], { integrity: false }));
   const dependencies = dependenciesFor([pkg]);
@@ -204,8 +200,7 @@ it.effect('SHA-1-only artifacts require the explicit legacy policy and never rea
   const legacyFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, dependencies));
   assert.match(legacyFailure.message, /SHA-1-only/);
   assert.equal((yield* loadInventory(stateDirectory)).artifacts.length, 0);
-  const legacyConfig = structuredClone(config);
-  legacyConfig.policy.allowLegacySha1Only = true;
+  const legacyConfig = parseConfig(JSON.stringify({ ...config, policy: { ...config.policy, allowLegacySha1Only: true } }));
   yield* fetchInventory({ stateDirectory, config: legacyConfig }, dependencies);
   const record = (yield* loadInventory(stateDirectory)).artifacts[0];
   assert.equal(record.artifact.legacySha1Only, true);
@@ -214,8 +209,7 @@ it.effect('SHA-1-only artifacts require the explicit legacy policy and never rea
 
 it.effect('fetch does not invent historical SHA-1 metadata when upstream supplies none', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('no-sha1', '1.0.0');
-  const pkg = { name: 'no-sha1', version: '1.0.0', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes, { shasum: false });
+  const pkg = testPackage('no-sha1', '1.0.0', bytes, { shasum: false });
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg]));
 
@@ -227,13 +221,12 @@ it.effect('fetch does not invent historical SHA-1 metadata when upstream supplie
 
 it.effect('fetch requests scoped metadata with an encoded slash', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('@scope/demo', '1.0.0');
-  const pkg = { name: '@scope/demo', version: '1.0.0', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('@scope/demo', '1.0.0', bytes);
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg]));
-  const urls = [];
+  const urls: string[] = [];
   const dependencies = dependenciesFor([pkg], {
-    exchange: async (url, options) => {
+    exchange: async (url: URL, options: Parameters<RequiredFetchDependencies['exchange']>[1]) => {
       urls.push(url.href);
       return dependenciesFor([pkg]).exchange(url, options);
     },
@@ -246,8 +239,7 @@ it.effect('fetch requests scoped metadata with an encoded slash', () => withScra
 
 it.effect('fetch rejects unsafe redirects and oversized response declarations before writing objects', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('flatdemo', '1.2.3', bytes);
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const redirects = dependenciesFor([pkg], {
@@ -272,7 +264,7 @@ it.effect('fetch rejects unsafe redirects and oversized response declarations be
   assert.match(redirectLimitFailure.message, /5 redirect limit/);
   assert.equal(redirectCount, 6);
 
-  const privateResolution = dependenciesFor([pkg], { resolveAddresses: async () => [{ address: '127.0.0.1', family: 4 }] });
+  const privateResolution = dependenciesFor([pkg], { resolveAddresses: (async () => [{ address: '127.0.0.1', family: 4 }]) as unknown as RequiredFetchDependencies['resolveAddresses'] });
   const privateAddressFailure = yield* Effect.flip(fetchInventory({ stateDirectory, config }, privateResolution));
   assert.match(privateAddressFailure.message, /non-public address/);
 
@@ -295,8 +287,7 @@ it.effect('fetch rejects unsafe redirects and oversized response declarations be
 
 it.effect('fetch enforces the metadata limit while streaming when Content-Length is absent', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('flatdemo', '1.2.3', bytes);
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const chunk = Buffer.alloc(1024 ** 2);
@@ -319,8 +310,7 @@ it.effect('fetch enforces the metadata limit while streaming when Content-Length
 
 it.effect('fetch stops aborted streams and removes private staging files', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('flatdemo', '1.2.3', bytes);
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg]));
   const bodyStarted = yield* Deferred.make();
@@ -354,8 +344,7 @@ it.effect('fetch stops aborted streams and removes private staging files', () =>
 
 it.effect('fetch removes interrupted staging from a dead fetch process before acquiring artifacts', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('flatdemo', '1.2.3', bytes);
   const stateDirectory = join(directory, 'state');
   const stagingRoot = join(stateDirectory, 'tmp');
   const interrupted = join(stagingRoot, 'mynpm-fetch-2147483647-interrupted');
@@ -370,25 +359,24 @@ it.effect('fetch removes interrupted staging from a dead fetch process before ac
 
 it.effect('fetch enforces per-request and whole-operation timeouts through controlled timers', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('flatdemo', '1.2.3', bytes);
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, makeInventory([pkg]));
-  const controlled = firingDelay => ({
-    scheduleTimeout(callback, delay) {
+  const controlled = (firingDelay: number) => ({
+    scheduleTimeout: ((callback: () => void, delay: number) => {
       const timer = { cleared: false };
       if (delay === firingDelay) queueMicrotask(() => { if (!timer.cleared) callback(); });
       return timer;
-    },
-    clearScheduledTimeout(timer) { timer.cleared = true; },
+    }) as unknown as RequiredFetchDependencies['scheduleTimeout'],
+    clearScheduledTimeout: ((timer: { cleared?: boolean }) => { if (timer.cleared !== undefined) timer.cleared = true; }) as unknown as RequiredFetchDependencies['clearScheduledTimeout'],
   });
   const waitingRequest = {
     ...dependenciesFor([pkg]),
     ...controlled(limits.requestMilliseconds),
-    exchange: async (_url, { signal }) => new Promise((resolve, reject) => {
+    exchange: (async (_url: URL, { signal }: { signal: AbortSignal }) => new Promise<never>((resolve, reject) => {
       if (signal.aborted) reject(signal.reason);
       else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    }),
+    })) as RequiredFetchDependencies['exchange'],
   };
   const requestTimeout = yield* Effect.flip(fetchInventory({ stateDirectory, config }, waitingRequest));
   assert.equal(requestTimeout.category, 'operation');
@@ -405,8 +393,7 @@ it.effect('fetch enforces per-request and whole-operation timeouts through contr
 
 it.effect('fetch rejects symbolic-link staging and object-store directories without writing through them', () => withScratch(directory => Effect.gen(function*() {
   const bytes = packageTar('flatdemo', '1.2.3');
-  const pkg = { name: 'flatdemo', version: '1.2.3', bytes };
-  pkg.metadata = packageMetadata(pkg.name, pkg.version, bytes);
+  const pkg = testPackage('flatdemo', '1.2.3', bytes);
   const stateDirectory = join(directory, 'state');
   const outside = join(directory, 'outside');
   mkdirSync(stateDirectory);
@@ -440,21 +427,21 @@ it.effect('fetch caps active acquisition at four concurrent packages', () => wit
   yield* saveInventory(stateDirectory, makeInventory(packages));
   let active = 0;
   let peak = 0;
-  let notifyBatch;
-  let releaseBatch;
-  const firstBatch = new Promise(resolve => { notifyBatch = resolve; });
-  const batchGate = new Promise(resolve => { releaseBatch = resolve; });
+  let notifyBatch = () => {};
+  let releaseBatch = () => {};
+  const firstBatch = new Promise<void>(resolve => { notifyBatch = resolve; });
+  const batchGate = new Promise<void>(resolve => { releaseBatch = resolve; });
   let held = 0;
   const base = dependenciesFor(packages);
   const dependencies = {
     ...base,
-    exchange: async url => {
+    exchange: async (url: URL, options: Parameters<RequiredFetchDependencies['exchange']>[1]) => {
       active += 1;
       peak = Math.max(peak, active);
       held += 1;
       if (held === 4) notifyBatch();
       if (held <= 4) await batchGate;
-      const result = await base.exchange(url);
+      const result = await base.exchange(url, options);
       const close = result.close?.bind(result);
       result.close = () => { active -= 1; close?.(); };
       return result;

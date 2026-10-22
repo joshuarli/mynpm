@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'vitest';
 import { parseNpmLock } from '../src/lock-npm.ts';
 import { createEmptyInventory, mergeProject, parseInventory, recordVerifiedArtifact, serializeInventory } from '../src/inventory.ts';
+import { hasErrorCategory } from './support.ts';
 
 const lock = JSON.parse(readFileSync(new URL('./fixtures/locks/package-lock-v3.json', import.meta.url), 'utf8'));
 
@@ -31,17 +32,17 @@ test('inventory imports are idempotent and conflicting digests fail', () => {
   conflict.packages['node_modules/catalog-alias'].integrity = 'sha512-' + Buffer.alloc(64, 1).toString('base64');
   assert.throws(
     () => mergeProject(inventory, project(conflict)),
-    error => error.category === 'conflict',
+    hasErrorCategory('conflict'),
   );
 });
 
 test('inventory rejects unknown schema versions and malformed fields', () => {
-  assert.throws(() => parseInventory('{"schemaVersion":1,"projects":[],"artifacts":[]}'), error => error.category === 'corrupt');
-  assert.throws(() => parseInventory('{"schemaVersion":2,"projects":[],"artifacts":[],"extra":true}'), error => error.category === 'corrupt');
-  assert.throws(() => parseInventory('{'), error => error.category === 'corrupt');
+  assert.throws(() => parseInventory('{"schemaVersion":1,"projects":[],"artifacts":[]}'), hasErrorCategory('corrupt'));
+  assert.throws(() => parseInventory('{"schemaVersion":2,"projects":[],"artifacts":[],"extra":true}'), hasErrorCategory('corrupt'));
+  assert.throws(() => parseInventory('{'), hasErrorCategory('corrupt'));
   const invalidImporter = structuredClone(mergeProject(createEmptyInventory(), project()));
   invalidImporter.projects[0].roots[0].importer = '../outside';
-  assert.throws(() => parseInventory(JSON.stringify(invalidImporter)), error => error.category === 'corrupt');
+  assert.throws(() => parseInventory(JSON.stringify(invalidImporter)), hasErrorCategory('corrupt'));
 });
 
 test('inventory retains immutable project snapshots and rejects unsafe snapshot paths', () => {
@@ -56,16 +57,20 @@ test('inventory retains immutable project snapshots and rejects unsafe snapshot 
   assert.deepEqual(inventory.projects[0].snapshot, snapshot);
 
   const unsafe = structuredClone(inventory);
-  unsafe.projects[0].snapshot.workspaceFiles[0].path = '../package.json';
-  assert.throws(() => parseInventory(JSON.stringify(unsafe)), error => error.category === 'corrupt');
+  const unsafeSnapshot = unsafe.projects[0]?.snapshot;
+  assert.ok(unsafeSnapshot);
+  unsafeSnapshot.workspaceFiles[0].path = '../package.json';
+  assert.throws(() => parseInventory(JSON.stringify(unsafe)), hasErrorCategory('corrupt'));
 
   const unknownImporter = structuredClone(inventory);
   unknownImporter.projects[0].importers = [];
-  assert.throws(() => parseInventory(JSON.stringify(unknownImporter)), error => error.category === 'corrupt');
+  assert.throws(() => parseInventory(JSON.stringify(unknownImporter)), hasErrorCategory('corrupt'));
 
   const unexpectedFile = structuredClone(inventory);
-  unexpectedFile.projects[0].snapshot.workspaceFiles.push({ path: '.npmrc', contents: 'registry=https://example.invalid/' });
-  assert.throws(() => parseInventory(JSON.stringify(unexpectedFile)), error => error.category === 'corrupt');
+  const unexpectedFileSnapshot = unexpectedFile.projects[0]?.snapshot;
+  assert.ok(unexpectedFileSnapshot);
+  unexpectedFileSnapshot.workspaceFiles.push({ path: '.npmrc', contents: 'registry=https://example.invalid/' });
+  assert.throws(() => parseInventory(JSON.stringify(unexpectedFile)), hasErrorCategory('corrupt'));
 });
 
 test('inventory defaults old project snapshots and validates saved npm install options', () => {
@@ -78,19 +83,27 @@ test('inventory defaults old project snapshots and validates saved npm install o
       npmInstallOptions: { legacyPeerDeps: null, installLinks: null },
     },
   }));
-  delete imported.projects[0].snapshot.npmInstallOptions;
+  const importedSnapshot = imported.projects[0]?.snapshot;
+  assert.ok(importedSnapshot);
+  delete (importedSnapshot as unknown as { npmInstallOptions?: unknown }).npmInstallOptions;
   const oldShape = parseInventory(JSON.stringify(imported));
-  assert.deepEqual(oldShape.projects[0].snapshot.npmInstallOptions, { legacyPeerDeps: null, installLinks: null });
+  const oldShapeSnapshot = oldShape.projects[0]?.snapshot;
+  assert.ok(oldShapeSnapshot);
+  assert.deepEqual(oldShapeSnapshot.npmInstallOptions, { legacyPeerDeps: null, installLinks: null });
 
   const malformed = structuredClone(oldShape);
-  malformed.projects[0].snapshot.npmInstallOptions.installLinks = 'false';
-  assert.throws(() => parseInventory(JSON.stringify(malformed)), error => error.category === 'corrupt');
+  const malformedSnapshot = malformed.projects[0]?.snapshot;
+  assert.ok(malformedSnapshot);
+  (malformedSnapshot.npmInstallOptions as unknown as Record<string, unknown>).installLinks = 'false';
+  assert.throws(() => parseInventory(JSON.stringify(malformed)), hasErrorCategory('corrupt'));
 
   const pnpmOptions = structuredClone(oldShape);
   pnpmOptions.projects[0].manager = 'pnpm';
   pnpmOptions.projects[0].lockfileVersion = '9.0';
-  pnpmOptions.projects[0].snapshot.npmInstallOptions.legacyPeerDeps = true;
-  assert.throws(() => parseInventory(JSON.stringify(pnpmOptions)), error => error.category === 'corrupt');
+  const pnpmSnapshot = pnpmOptions.projects[0]?.snapshot;
+  assert.ok(pnpmSnapshot);
+  pnpmSnapshot.npmInstallOptions.legacyPeerDeps = true;
+  assert.throws(() => parseInventory(JSON.stringify(pnpmOptions)), hasErrorCategory('corrupt'));
 });
 
 test('inventory records matching verified metadata and rejects divergent artifact identities', () => {
@@ -118,6 +131,7 @@ test('inventory records matching verified metadata and rejects divergent artifac
   const recorded = recordVerifiedArtifact(inventory, { name: 'real-package', version: '1.2.3', packument, metadata, artifact });
   const packageRecords = recorded.projects.flatMap(item => item.packages).filter(item => item.name === 'real-package' && item.version === '1.2.3');
   assert.equal(packageRecords.length, 1);
+  assert.ok(packageRecords[0]);
   assert.equal(Object.hasOwn(packageRecords[0], 'artifact'), false);
   assert.deepEqual(recorded.artifacts[0], { name: 'real-package', version: '1.2.3', packument, metadata, artifact });
   assert.deepEqual(parseInventory(serializeInventory(recorded)), recorded);
@@ -125,7 +139,10 @@ test('inventory records matching verified metadata and rejects divergent artifac
   secondProject.id = 'another';
   secondProject.lockfilePath = 'another/package-lock.json';
   const merged = mergeProject(recorded, secondProject);
-  const retained = merged.projects.find(item => item.id === 'another').packages.find(item => item.name === 'real-package');
+  const retainedProject = merged.projects.find(item => item.id === 'another');
+  assert.ok(retainedProject);
+  const retained = retainedProject.packages.find(item => item.name === 'real-package');
+  assert.ok(retained);
   assert.equal(Object.hasOwn(retained, 'artifact'), false);
   assert.deepEqual(merged.artifacts[0].artifact, artifact);
   assert.throws(
@@ -134,6 +151,6 @@ test('inventory records matching verified metadata and rejects divergent artifac
       sha512: Buffer.alloc(64, 1).toString('hex'),
       integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
     } }),
-    error => error.category === 'conflict',
+    hasErrorCategory('conflict'),
   );
 });

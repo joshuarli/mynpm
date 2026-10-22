@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { it, test } from '@effect/vitest';
 import { Effect } from 'effect';
 import { parsePnpmLock, parsePnpmDocuments, pnpmBuildPackageKeys } from '../src/lock-pnpm.ts';
+import { MynpmError } from '../src/errors.ts';
 
 const fixture = new URL('./fixtures/locks/pnpm-v9-local.yaml', import.meta.url);
 const twoDocumentFixture = new URL('./fixtures/locks/pnpm-v12-two-documents.yaml', import.meta.url);
@@ -13,7 +14,7 @@ let yamlAvailable = true;
 try {
   await import('yaml');
 } catch (error) {
-  if (error.code === 'ERR_MODULE_NOT_FOUND') yamlAvailable = false;
+  if (error instanceof Error && 'code' in error && error.code === 'ERR_MODULE_NOT_FOUND') yamlAvailable = false;
   else throw error;
 }
 
@@ -122,6 +123,7 @@ test('pnpm documents union packages, roots, aliases, and peer-context snapshots'
   const alias = project.roots.find(root => root.requestedName === 'alias-app');
   const optional = project.packages.find(pkg => pkg.name === 'native-optional');
 
+  assert.ok(optional);
   assert.equal(project.packages.length, 5);
   assert.equal(project.packages.filter(pkg => pkg.name === '@scope/app').length, 1);
   assert.deepEqual(alias, {
@@ -285,5 +287,5 @@ test('pnpm rejects unsupported revisions, unmatched snapshots, and conflicting d
 
   assert.throws(() => parsePnpmDocuments([revision], options), /unsupported resolution revision 1/);
   assert.throws(() => parsePnpmDocuments([unmatched], options), /no matching package entry/);
-  assert.throws(() => parsePnpmDocuments([base, changed], options), error => error.category === 'conflict');
+  assert.throws(() => parsePnpmDocuments([base, changed], options), error => error instanceof MynpmError && error.category === 'conflict');
 });

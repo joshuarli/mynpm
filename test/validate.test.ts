@@ -1,43 +1,59 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { it } from '@effect/vitest';
 import { Effect } from 'effect';
-import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.ts';
-import { createEmptyInventory, mergeProject, recordVerifiedArtifact } from '../src/inventory.ts';
+import type { MynpmConfig, TargetConfig } from '../src/config.ts';
+import { MynpmError } from '../src/errors.ts';
+import { createEmptyInventory, mergeProject, parseInventory, recordVerifiedArtifact } from '../src/inventory.ts';
 import { parseNpmLock } from '../src/lock-npm.ts';
 import { parsePnpmLock } from '../src/lock-pnpm.ts';
 import { saveInventory } from '../src/inventory-store.ts';
 import { managerVersions } from '../src/resolve.ts';
 import { runProcess } from '../src/process.ts';
+import type { RunProcessOptions } from '../src/process.ts';
 import { validateInventory } from '../src/validate.ts';
+import { hasErrorCategory, withScratch } from './support.ts';
 
-const scratchRoot = fileURLToPath(new URL('../.work/tmp/', import.meta.url));
 const config = parseConfig(readFileSync(new URL('./fixtures/mynpm.json', import.meta.url), 'utf8'));
+type MutablePackageEntry = { [key: string]: unknown; version?: string; resolved?: string; integrity?: string; link?: boolean; dependencies?: Record<string, unknown> };
+type NpmTestLock = { [key: string]: unknown; lockfileVersion?: number; packages: Record<string, MutablePackageEntry>; dependencies?: Record<string, unknown> };
+type SavedNpmProject = {
+  stateDirectory: string;
+  config: MynpmConfig;
+  bytes: Buffer;
+  lock: NpmTestLock;
+  lockText: string;
+  manifestText: string;
+  target: TargetConfig;
+  optionalSha512: string | null;
+  nestedBytes: Buffer | null;
+  nestedSha512: string | null;
+};
+type PostInstallCheck = (lock: NpmTestLock, projectDirectory: string) => Effect.Effect<void, never>;
 
-function currentTarget() {
+function currentTarget(): TargetConfig {
   const os = process.platform === 'darwin' ? 'darwin' : 'linux';
   const cpu = process.arch === 'arm64' ? 'arm64' : 'x64';
-  const libc = os === 'linux' ? process.report?.getReport()?.header?.glibcVersionRuntime ? 'glibc' : 'musl' : null;
-  return config.targets.find(target => target.os === os && target.cpu === cpu && (target.libc ?? null) === libc);
+  const report = process.report?.getReport() as unknown as { header?: { glibcVersionRuntime?: string } } | undefined;
+  const libc = os === 'linux' && report?.header?.glibcVersionRuntime !== undefined ? 'glibc' : 'musl';
+  const target = config.targets.find(candidate => candidate.os === os && candidate.cpu === cpu && ('libc' in candidate ? candidate.libc === libc : os === 'darwin'));
+  if (target === undefined) throw new Error(`fixture config does not include the current target ${os}-${cpu}`);
+  return target;
 }
 
-function withScratch(prefix, run) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      mkdirSync(scratchRoot, { recursive: true });
-      return mkdtempSync(join(scratchRoot, prefix));
-    }),
-    run,
-    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
-  );
+function configForCurrentNode(targetId: string): MynpmConfig {
+  return parseConfig(JSON.stringify({
+    ...config,
+    targets: config.targets.map(target => target.id === targetId ? { ...target, node: process.versions.node } : target),
+  }));
 }
 
-function assertFailure(effect, check) {
+function assertFailure(effect: Effect.Effect<unknown, unknown>, check: (error: unknown) => boolean): Effect.Effect<void> {
   return Effect.gen(function*() {
     const result = yield* Effect.result(effect);
     assert.equal(result._tag, 'Failure');
@@ -45,7 +61,7 @@ function assertFailure(effect, check) {
   });
 }
 
-function tarMember(name, content) {
+function tarMember(name: string, content: Buffer): Buffer {
   const header = Buffer.alloc(512);
   header.write(name, 0, 100, 'utf8');
   header.write('0000644\0', 100, 8, 'ascii');
@@ -63,7 +79,7 @@ function tarMember(name, content) {
   return Buffer.concat([header, padded]);
 }
 
-function packageTarball(name, version, { dependencies = {}, peerDependencies = {}, os } = {}) {
+function packageTarball(name: string, version: string, { dependencies = {}, peerDependencies = {}, os }: { dependencies?: Record<string, string>; peerDependencies?: Record<string, string>; os?: string[] } = {}): Buffer {
   const manifest = Buffer.from(JSON.stringify({ name, version, main: 'index.js', dependencies, peerDependencies, ...(os === undefined ? {} : { os }) }));
   return gzipSync(Buffer.concat([
     tarMember('package/package.json', manifest),
@@ -72,7 +88,7 @@ function packageTarball(name, version, { dependencies = {}, peerDependencies = {
   ]));
 }
 
-function savedNpmProject(directory, { optionalPackage = false, nestedPackage = false, aliasPackage = false, workspacePackage = false, lockVersion = 3 } = {}) {
+function savedNpmProject(directory: string, { optionalPackage = false, nestedPackage = false, aliasPackage = false, workspacePackage = false, lockVersion = 3 }: { optionalPackage?: boolean; nestedPackage?: boolean; aliasPackage?: boolean; workspacePackage?: boolean; lockVersion?: 2 | 3 } = {}): Effect.Effect<SavedNpmProject, MynpmError> {
   return Effect.gen(function*() {
     const target = currentTarget();
     const bytes = nestedPackage
@@ -106,7 +122,7 @@ function savedNpmProject(directory, { optionalPackage = false, nestedPackage = f
       ...(optionalPackage ? { optionalDependencies: { optdep: '1.0.0' } } : {}),
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
-    const packageEntries = {
+    const packageEntries: Record<string, MutablePackageEntry> = {
       '': {
         name: manifest.name,
         version: manifest.version,
@@ -153,7 +169,7 @@ function savedNpmProject(directory, { optionalPackage = false, nestedPackage = f
         optional: true,
       };
     }
-    const lock = {
+    const lock: NpmTestLock = {
       name: manifest.name,
       version: manifest.version,
       lockfileVersion: lockVersion,
@@ -181,6 +197,7 @@ function savedNpmProject(directory, { optionalPackage = false, nestedPackage = f
         manifest: manifestText,
         lockfile: lockText,
         workspaceFiles: workspaceManifest === null ? [] : [{ path: 'packages/workspace-link/package.json', contents: workspaceManifest }],
+        npmInstallOptions: { legacyPeerDeps: null, installLinks: null },
       },
     });
     let inventory = mergeProject(createEmptyInventory(), project);
@@ -235,13 +252,12 @@ function savedNpmProject(directory, { optionalPackage = false, nestedPackage = f
     if (nestedBytes !== null && nestedSha512 !== null) writeFileSync(join(objectDirectory, `${nestedSha512}.tgz`), nestedBytes);
     if (optionalBytes !== null && optionalSha512 !== null) writeFileSync(join(objectDirectory, `${optionalSha512}.tgz`), optionalBytes);
     yield* saveInventory(stateDirectory, inventory);
-    const testConfig = structuredClone(config);
-    testConfig.targets.find(item => item.id === target.id).node = process.versions.node;
+    const testConfig = configForCurrentNode(target.id);
     return { stateDirectory, config: testConfig, bytes, lock, lockText, manifestText, target, optionalSha512, nestedBytes, nestedSha512 };
   });
 }
 
-function savedPnpmWorkspace(directory, { optionalPackage = false, optionalPlatform = false } = {}) {
+function savedPnpmWorkspace(directory: string, { optionalPackage = false, optionalPlatform = false }: { optionalPackage?: boolean; optionalPlatform?: boolean } = {}) {
   return Effect.gen(function*() {
     const target = currentTarget();
     const bytes = readFileSync(new URL('./fixtures/tarballs/flatdemo-1.2.3.tgz', import.meta.url));
@@ -314,6 +330,7 @@ ${optionalPackage ? '  optdep@1.0.0: {}\n' : ''}
           { path: 'apps/web/package.json', contents: appManifest },
           { path: 'pnpm-workspace.yaml', contents: workspaceManifest },
         ],
+        npmInstallOptions: { legacyPeerDeps: null, installLinks: null },
       },
     });
     let inventory = mergeProject(createEmptyInventory(), project);
@@ -341,13 +358,12 @@ ${optionalPackage ? '  optdep@1.0.0: {}\n' : ''}
     writeFileSync(join(objectDirectory, `${sha512}.tgz`), bytes);
     if (optionalBytes !== null && optionalSha512 !== null) writeFileSync(join(objectDirectory, `${optionalSha512}.tgz`), optionalBytes);
     yield* saveInventory(stateDirectory, inventory);
-    const testConfig = structuredClone(config);
-    testConfig.targets.find(item => item.id === target.id).node = process.versions.node;
+    const testConfig = configForCurrentNode(target.id);
     return { stateDirectory, config: testConfig, target, optionalSha512 };
   });
 }
 
-function savedPnpmPeerProject(directory) {
+function savedPnpmPeerProject(directory: string) {
   return Effect.gen(function*() {
     const target = currentTarget();
     const packages = [
@@ -398,7 +414,7 @@ snapshots:
       packageManagerPin: 'pnpm@12.15.0',
       lockfilePath: 'pnpm-lock.yaml',
       targetIds: [target.id],
-      snapshot: { manifest: manifestText, lockfile: lockText, workspaceFiles: [] },
+      snapshot: { manifest: manifestText, lockfile: lockText, workspaceFiles: [], npmInstallOptions: { legacyPeerDeps: null, installLinks: null } },
     });
     let inventory = mergeProject(createEmptyInventory(), project);
     for (const pkg of packages) {
@@ -415,14 +431,17 @@ snapshots:
     mkdirSync(objectDirectory, { recursive: true });
     for (const pkg of packages) writeFileSync(join(objectDirectory, `${pkg.sha512}.tgz`), pkg.bytes);
     yield* saveInventory(stateDirectory, inventory);
-    const testConfig = structuredClone(config);
-    testConfig.targets.find(item => item.id === target.id).node = process.versions.node;
+    const testConfig = configForCurrentNode(target.id);
     return { stateDirectory, config: testConfig, button, react };
   });
 }
 
-function fakeNpm(restore, afterInstall = () => Effect.void, { installPackage = true, report = true } = {}) {
-  return (command, args, options) => Effect.gen(function*() {
+function testRequest<A>(operation: () => Promise<A>): Effect.Effect<A, MynpmError> {
+  return Effect.tryPromise({ try: operation, catch: cause => new MynpmError('operation', 'test request failed', { cause }) });
+}
+
+function fakeNpm(restore: SavedNpmProject, afterInstall: PostInstallCheck = () => Effect.void, { installPackage = true, report = true }: { installPackage?: boolean; report?: boolean } = {}): typeof runProcess {
+  return (command: string, args: readonly string[], options: RunProcessOptions) => Effect.gen(function*() {
     if (args[0] === '--version') return { stdout: '12.2.1\n', stderr: '' };
     assert.equal(command, 'npm');
     if (args[0] === 'ls') {
@@ -435,23 +454,27 @@ function fakeNpm(restore, afterInstall = () => Effect.void, { installPackage = t
     const manifest = readFileSync(join(options.cwd, 'package.json'), 'utf8');
     assert.equal(manifest, restore.manifestText);
     const lockText = readFileSync(join(options.cwd, 'package-lock.json'), 'utf8');
-    const lock = JSON.parse(lockText);
+    const lock = JSON.parse(lockText) as NpmTestLock;
     const resolved = lock.packages['node_modules/flatdemo'].resolved;
+    assert.ok(resolved);
     assert.match(resolved, /^http:\/\/127\.0\.0\.1:\d+\/(?:mirror\/)?current\/-\/tarballs\/[a-f0-9]{128}\.tgz$/);
     assert.deepEqual(lock.packages[''].dependencies, { flatdemo: '1.2.3' });
-    const metadataResponse = yield* Effect.tryPromise(() => fetch(`${options.env.npm_config_registry}flatdemo`));
+    const registry = options.env.npm_config_registry;
+    assert.ok(registry);
+    const metadataResponse = yield* testRequest(() => fetch(`${registry}flatdemo`));
     assert.equal(metadataResponse.status, 200);
-    const metadata = yield* Effect.tryPromise(() => metadataResponse.json());
+    const metadata = yield* testRequest(() => metadataResponse.json() as Promise<{ versions: Record<string, { dist: { tarball: string } }> }>);
     assert.equal(resolved, metadata.versions['1.2.3'].dist.tarball);
-    const tarballResponse = yield* Effect.tryPromise(() => fetch(resolved));
+    const tarballResponse = yield* testRequest(() => fetch(resolved));
     assert.equal(tarballResponse.status, 200);
-    const tarball = yield* Effect.tryPromise(() => tarballResponse.arrayBuffer());
+    const tarball = yield* testRequest(() => tarballResponse.arrayBuffer());
     assert.deepEqual(Buffer.from(tarball), restore.bytes);
     if (restore.nestedBytes !== null) {
       const nestedResolved = lock.packages['node_modules/flatdemo/node_modules/nesteddep'].resolved;
-      const nestedResponse = yield* Effect.tryPromise(() => fetch(nestedResolved));
+      assert.ok(nestedResolved);
+      const nestedResponse = yield* testRequest(() => fetch(nestedResolved));
       assert.equal(nestedResponse.status, 200);
-      assert.deepEqual(Buffer.from(yield* Effect.tryPromise(() => nestedResponse.arrayBuffer())), restore.nestedBytes);
+      assert.deepEqual(Buffer.from(yield* testRequest(() => nestedResponse.arrayBuffer())), restore.nestedBytes);
     }
     yield* afterInstall(lock, options.cwd);
     if (installPackage) {
@@ -477,19 +500,19 @@ it.effect('validate fails before package acquisition when the pinned Node or pac
   if (process.version !== `v${target.node}`) {
     yield* assertFailure(
       validateInventory({ client: 'npm', stateDirectory, config }),
-      error => error.category === 'operation' && error.message.includes(`requires Node.js ${target.node}`),
+      error => hasErrorCategory('operation')(error) && error.message.includes(`requires Node.js ${target.node}`),
     );
   } else {
     const npmVersion = spawnSync('npm', ['--version'], { encoding: 'utf8' }).stdout.trim();
     if (npmVersion !== managerVersions.npm) {
       yield* assertFailure(
         validateInventory({ client: 'npm', stateDirectory, config }),
-        error => error.category === 'operation' && error.message.includes(`npm ${managerVersions.npm} is required`),
+        error => hasErrorCategory('operation')(error) && error.message.includes(`npm ${managerVersions.npm} is required`),
       );
     } else {
       yield* assertFailure(
         validateInventory({ client: 'npm', stateDirectory, config }),
-        error => /requires an imported package.json snapshot/.test(error.message),
+        error => error instanceof Error && /requires an imported package.json snapshot/.test(error.message),
       );
     }
   }
@@ -507,8 +530,11 @@ it.effect('validate restores the original npm manifest and lock graph through lo
 
 it.effect('validate forwards captured npm install-shaping settings to npm ci', () => withScratch('validate-npm-install-options-', directory => Effect.gen(function*() {
   const restore = yield* savedNpmProject(directory);
-  const inventory = JSON.parse(readFileSync(join(restore.stateDirectory, 'inventory.json'), 'utf8'));
-  inventory.projects[0].snapshot.npmInstallOptions = { legacyPeerDeps: true, installLinks: false };
+  const inventory = structuredClone(parseInventory(readFileSync(join(restore.stateDirectory, 'inventory.json'), 'utf8')));
+  const project = inventory.projects[0];
+  assert.ok(project);
+  assert.ok(project.snapshot);
+  project.snapshot.npmInstallOptions = { legacyPeerDeps: true, installLinks: false };
   yield* saveInventory(restore.stateDirectory, inventory);
   let sawInstallOptions = false;
   const client = fakeNpm(restore);
@@ -537,11 +563,18 @@ it.effect.skipIf(process.env.MYNPM_REQUIRE_STATIC_CLIENTS !== '1' && (Number(pro
 
 it.effect.skipIf(process.env.MYNPM_REQUIRE_STATIC_CLIENTS !== '1' && (Number(process.versions.node.split('.')[0]) < 26 || spawnSync('npm', ['--version'], { encoding: 'utf8' }).stdout?.trim() !== '12.2.1'))('validate preserves npm aliases, nested versions, overrides, and workspace links', () => withScratch('validate-npm-complete-graph-', directory => Effect.gen(function*() {
   const restore = yield* savedNpmProject(directory, { nestedPackage: true, aliasPackage: true, workspacePackage: true });
-  const inventory = JSON.parse(readFileSync(join(restore.stateDirectory, 'inventory.json'), 'utf8'));
+  const inventory = parseInventory(readFileSync(join(restore.stateDirectory, 'inventory.json'), 'utf8'));
   const project = inventory.projects[0];
+  assert.ok(project);
+  assert.ok(project.snapshot);
   const lock = JSON.parse(project.snapshot.lockfile);
-  assert.equal(project.packages.find(item => item.key === 'node_modules/catalog-alias').name, 'real-package');
-  assert.equal(project.packages.find(item => item.key === 'node_modules/flatdemo/node_modules/nesteddep').version, '2.0.0');
+  const alias = project.packages.find(item => item.key === 'node_modules/catalog-alias');
+  assert.ok(alias);
+  assert.equal(alias.name, 'real-package');
+  const nested = project.packages.find(item => item.key === 'node_modules/flatdemo/node_modules/nesteddep');
+  assert.ok(nested);
+  assert.equal(nested.version, '2.0.0');
+  assert.ok(project.snapshot.manifest);
   assert.deepEqual(JSON.parse(project.snapshot.manifest).overrides, { flatdemo: { nesteddep: '2.0.0' } });
   assert.deepEqual(project.snapshot.workspaceFiles.map(file => file.path), ['packages/workspace-link/package.json']);
   assert.equal(lock.packages['node_modules/workspace-link'].resolved, 'packages/workspace-link');
@@ -689,7 +722,7 @@ it.effect('validate rejects an npm client that changes the saved dependency grap
         writeFileSync(join(projectDirectory, 'package-lock.json'), `${JSON.stringify(lock, null, 2)}\n`);
       })),
     }),
-    error => error.category === 'conflict' && error.message.includes('changed the saved dependency graph'),
+    error => hasErrorCategory('conflict')(error) && error.message.includes('changed the saved dependency graph'),
   );
 })));
 
@@ -703,14 +736,13 @@ it.effect('validate refuses to rebuild a project when its imported manifest snap
   });
   const stateDirectory = join(directory, 'state');
   yield* saveInventory(stateDirectory, mergeProject(createEmptyInventory(), project));
-  const testConfig = structuredClone(config);
-  testConfig.targets.find(item => item.id === target.id).node = process.versions.node;
+  const testConfig = configForCurrentNode(target.id);
 
   yield* assertFailure(
     validateInventory({ client: 'npm', stateDirectory, config: testConfig }, {
       runProcess: () => Effect.succeed({ stdout: '12.2.1\n', stderr: '' }),
     }),
-    error => error.category === 'input' && error.message.includes('requires an imported package.json snapshot'),
+    error => hasErrorCategory('input')(error) && error.message.includes('requires an imported package.json snapshot'),
   );
 })));
 
@@ -721,7 +753,7 @@ it.effect('validate rejects an imported project pinned to another package-manage
   inventory.projects[0].packageManagerPin = 'npm@10.9.2';
   inventory.projects[0].snapshot.manifest = inventory.projects[0].snapshot.manifest.replace('npm@12.2.1', 'npm@10.9.2');
   yield* saveInventory(restore.stateDirectory, inventory);
-  const commands = [];
+  const commands: [string, string | undefined][] = [];
 
   yield* assertFailure(
     validateInventory({ client: 'npm', stateDirectory: restore.stateDirectory, config: restore.config }, {
@@ -730,7 +762,7 @@ it.effect('validate rejects an imported project pinned to another package-manage
         return { stdout: '12.2.1\n', stderr: '' };
       }),
     }),
-    error => error.category === 'input' && error.message.includes('validation requires npm@12.2.1'),
+    error => hasErrorCategory('input')(error) && error.message.includes('validation requires npm@12.2.1'),
   );
   assert.deepEqual(commands, []);
 })));
@@ -748,7 +780,7 @@ it.effect('validate rejects a saved lockfile that diverges from its imported pac
     validateInventory({ client: 'npm', stateDirectory: restore.stateDirectory, config: restore.config }, {
       runProcess: () => Effect.succeed({ stdout: '12.2.1\n', stderr: '' }),
     }),
-    error => error.category === 'corrupt' && error.message.includes('no longer matches imported project'),
+    error => hasErrorCategory('corrupt')(error) && error.message.includes('no longer matches imported project'),
   );
 })));
 
@@ -756,10 +788,11 @@ it.effect('validate rejects saved pnpm hooks before invoking a client', () => wi
   const restore = yield* savedPnpmWorkspace(directory);
   const inventoryPath = join(restore.stateDirectory, 'inventory.json');
   const inventory = JSON.parse(readFileSync(inventoryPath, 'utf8'));
-  const workspaceFile = inventory.projects[0].snapshot.workspaceFiles.find(file => file.path === 'pnpm-workspace.yaml');
+  const workspaceFile = inventory.projects[0].snapshot.workspaceFiles.find((file: { path: string; contents: string }) => file.path === 'pnpm-workspace.yaml');
+  assert.ok(workspaceFile);
   workspaceFile.contents = `${workspaceFile.contents}hooks:\n  readPackage: plugins/marker.cjs\n`;
   yield* saveInventory(restore.stateDirectory, inventory);
-  const commands = [];
+  const commands: [string, string | undefined][] = [];
 
   yield* assertFailure(
     validateInventory({ client: 'pnpm', stateDirectory: restore.stateDirectory, config: restore.config }, {
@@ -768,7 +801,7 @@ it.effect('validate rejects saved pnpm hooks before invoking a client', () => wi
         return { stdout: '12.15.0\n', stderr: '' };
       }),
     }),
-    error => error.category === 'input' && error.message.includes('executable hook'),
+    error => hasErrorCategory('input')(error) && error.message.includes('executable hook'),
   );
   assert.deepEqual(commands, []);
 })));
@@ -782,7 +815,7 @@ it.effect('validate rejects saved pnpm config dependencies before invoking a cli
     'configDependencies:\n      marker-plugin: 1.0.0',
   );
   yield* saveInventory(restore.stateDirectory, inventory);
-  const commands = [];
+  const commands: [string, string | undefined][] = [];
 
   yield* assertFailure(
     validateInventory({ client: 'pnpm', stateDirectory: restore.stateDirectory, config: restore.config }, {
@@ -791,7 +824,7 @@ it.effect('validate rejects saved pnpm config dependencies before invoking a cli
         return { stdout: '12.15.0\n', stderr: '' };
       }),
     }),
-    error => error.category === 'input' && error.message.includes('configuration dependency'),
+    error => hasErrorCategory('input')(error) && error.message.includes('configuration dependency'),
   );
   assert.deepEqual(commands, []);
 })));
@@ -805,7 +838,7 @@ it.effect('validate rejects saved pnpm package-manager boot dependencies before 
     'configDependencies: {}\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.15.0\n        version: 12.15.0',
   );
   yield* saveInventory(restore.stateDirectory, inventory);
-  const commands = [];
+  const commands: [string, string | undefined][] = [];
 
   yield* assertFailure(
     validateInventory({ client: 'pnpm', stateDirectory: restore.stateDirectory, config: restore.config }, {
@@ -814,7 +847,7 @@ it.effect('validate rejects saved pnpm package-manager boot dependencies before 
         return { stdout: '12.15.0\n', stderr: '' };
       }),
     }),
-    error => error.category === 'input' && error.message.includes('package-manager boot dependency'),
+    error => hasErrorCategory('input')(error) && error.message.includes('package-manager boot dependency'),
   );
   assert.deepEqual(commands, []);
 })));
@@ -825,7 +858,7 @@ it.effect('validate rejects a correct npm lockfile when a selected package is mi
     validateInventory({ client: 'npm', stateDirectory: restore.stateDirectory, config: restore.config }, {
       runProcess: fakeNpm(restore, () => Effect.void, { installPackage: false }),
     }),
-    error => error.category === 'conflict' && error.message.includes('flatdemo@1.2.3 is missing from the installed tree'),
+    error => hasErrorCategory('conflict')(error) && error.message.includes('flatdemo@1.2.3 is missing from the installed tree'),
   );
 })));
 
@@ -860,6 +893,6 @@ it.effect('validate rejects a wrong installed nested package version', () => wit
         writeFileSync(join(nestedDirectory, 'package.json'), JSON.stringify({ name: 'nesteddep', version: '9.9.9' }));
       })),
     }),
-    error => error.category === 'conflict' && error.message.includes('expected nesteddep@2.0.0'),
+    error => hasErrorCategory('conflict')(error) && error.message.includes('expected nesteddep@2.0.0'),
   );
 })));

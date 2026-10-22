@@ -1,28 +1,15 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { it } from '@effect/vitest';
 import { Effect } from 'effect';
-import { fileURLToPath } from 'node:url';
 import { parseNpmLock } from '../src/lock-npm.ts';
 import { parsePnpmLock } from '../src/lock-pnpm.ts';
 import { captureProjectSnapshot } from '../src/project-snapshot.ts';
 
-const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
-const scratchRoot = join(repositoryRoot, '.work', 'tmp');
 const npmLockFixture = JSON.parse(readFileSync(new URL('./fixtures/locks/package-lock-v3.json', import.meta.url), 'utf8'));
 const pnpmLockText = readFileSync(new URL('./fixtures/locks/pnpm-v12-two-documents.yaml', import.meta.url), 'utf8');
-
-function withScratch(run) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      mkdirSync(scratchRoot, { recursive: true });
-      return mkdtempSync(join(scratchRoot, 'mynpm-snapshot-'));
-    }),
-    run,
-    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
-  );
-}
+import { withScratch } from './support.ts';
 
 function npmLockWithoutCredentials() {
   const lock = structuredClone(npmLockFixture);
@@ -30,7 +17,7 @@ function npmLockWithoutCredentials() {
   return lock;
 }
 
-function npmProject(lock) {
+function npmProject(lock: unknown) {
   return parseNpmLock(lock, {
     projectId: 'web',
     lockfilePath: 'package-lock.json',
@@ -38,7 +25,7 @@ function npmProject(lock) {
   });
 }
 
-function captureNpm(projectDirectory, lock, manifest = '{"name":"web"}\n') {
+function captureNpm(projectDirectory: string, lock: unknown, manifest = '{"name":"web"}\n') {
   writeFileSync(join(projectDirectory, 'package.json'), manifest);
   writeFileSync(join(projectDirectory, 'package-lock.json'), `${JSON.stringify(lock)}\n`);
   return captureProjectSnapshot({
@@ -50,7 +37,7 @@ function captureNpm(projectDirectory, lock, manifest = '{"name":"web"}\n') {
   });
 }
 
-function capturePnpm(projectDirectory, lockfileText = pnpmLockText) {
+function capturePnpm(projectDirectory: string, lockfileText = pnpmLockText) {
   return Effect.gen(function*() {
     writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web","packageManager":"pnpm@12.15.0"}\n');
     writeFileSync(join(projectDirectory, 'pnpm-lock.yaml'), lockfileText);
@@ -116,7 +103,7 @@ it.effect('snapshot rejects unsupported npm project configuration without exposi
 
 it.effect('snapshot rejects credential-bearing URLs in manifests, workspaces, and locks', () => withScratch(directory => Effect.gen(function*() {
   const lock = npmLockWithoutCredentials();
-  const cases = [
+  const cases: { label: string; manifest: string; workspace: string | null; locked: boolean }[] = [
     {
       label: 'manifest',
       manifest: '{"name":"web","dependencies":{"private":"https://user:secret@example.invalid/pkg.tgz?token=secret"}}\n',
@@ -172,7 +159,7 @@ it.effect('snapshot rejects credential-bearing URLs in manifests, workspaces, an
 
 it.effect('pnpm snapshot rejects executable, registry, runtime, and patch configuration', () => withScratch(directory => Effect.gen(function*() {
   const hookMarker = join(directory, 'hook-executed');
-  const cases = [
+  const cases: { label: string; setup: (projectDirectory: string) => void }[] = [
     { label: 'pnpmfile', setup: projectDirectory => writeFileSync(join(projectDirectory, '.pnpmfile.cjs'), `require('node:fs').writeFileSync(${JSON.stringify(hookMarker)}, 'ran');\n`) },
     { label: 'registry', setup: projectDirectory => writeFileSync(join(projectDirectory, 'pnpm-workspace.yaml'), 'registry: https://registry.example.invalid/\n') },
     { label: 'runtime', setup: projectDirectory => writeFileSync(join(projectDirectory, 'pnpm-workspace.yaml'), 'runtime: node@24.0.0\n') },

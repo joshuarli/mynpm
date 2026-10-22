@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'vitest';
 import { parseNpmLock } from '../src/lock-npm.ts';
+import type { PackageRecord } from '../src/inventory.ts';
+import { hasErrorCategory } from './support.ts';
 
 const lockPath = new URL('./fixtures/locks/package-lock-v3.json', import.meta.url);
 const v3Lock = JSON.parse(readFileSync(lockPath, 'utf8'));
@@ -15,6 +17,12 @@ function parse(lock = v3Lock) {
   });
 }
 
+function packageBy(packages: PackageRecord[], predicate: (pkg: PackageRecord) => boolean): PackageRecord {
+  const found = packages.find(predicate);
+  assert.ok(found);
+  return found;
+}
+
 test('npm v2 and v3 lockfiles preserve nested, scoped, and aliased identities', () => {
   const v3 = parse();
   const v2 = parse(v2Lock);
@@ -22,17 +30,19 @@ test('npm v2 and v3 lockfiles preserve nested, scoped, and aliased identities', 
   assert.equal(v3.manager, 'npm');
   assert.equal(v3.lockfileVersion, 3);
   assert.equal(v2.lockfileVersion, 2);
+  assert.ok(v2.packages[0]);
   assert.equal(v2.packages[0].name, 'flatdemo');
-  assert.equal(v3.packages.find(pkg => pkg.key === 'node_modules/catalog-alias').name, 'real-package');
-  assert.equal(v3.packages.find(pkg => pkg.key === 'node_modules/catalog-alias').aliases[0], 'catalog-alias');
-  assert.deepEqual(v3.packages.filter(pkg => pkg.name === 'nested').map(pkg => pkg.version).sort((left, right) => left.localeCompare(right)), ['1.0.4', '2.1.0']);
-  assert.equal(v3.packages.find(pkg => pkg.name === '@scope/direct').version, '2.0.1');
+  assert.equal(packageBy(v3.packages, pkg => pkg.key === 'node_modules/catalog-alias').name, 'real-package');
+  assert.equal(packageBy(v3.packages, pkg => pkg.key === 'node_modules/catalog-alias').aliases[0], 'catalog-alias');
+  assert.deepEqual(v3.packages.filter(pkg => pkg.name === 'nested').map(pkg => pkg.version).filter((version): version is string => version !== null).sort((left, right) => left.localeCompare(right)), ['1.0.4', '2.1.0']);
+  assert.equal(packageBy(v3.packages, pkg => pkg.name === '@scope/direct').version, '2.0.1');
 });
 
 test('npm roots preserve requested aliases and dependency groups', () => {
   const imported = parse();
   const alias = imported.roots.find(root => root.requestedName === 'catalog-alias');
   const optional = imported.roots.find(root => root.requestedName === '@esbuild/linux-x64');
+  assert.ok(optional);
 
   assert.deepEqual(alias, {
     importer: '.',
@@ -48,9 +58,9 @@ test('npm roots preserve requested aliases and dependency groups', () => {
 
 test('npm package flags and platform restrictions remain explicit', () => {
   const imported = parse();
-  const dev = imported.packages.find(pkg => pkg.name === 'dev-only');
-  const peer = imported.packages.find(pkg => pkg.name === 'peer-only');
-  const optional = imported.packages.find(pkg => pkg.name === '@esbuild/linux-x64');
+  const dev = packageBy(imported.packages, pkg => pkg.name === 'dev-only');
+  const peer = packageBy(imported.packages, pkg => pkg.name === 'peer-only');
+  const optional = packageBy(imported.packages, pkg => pkg.name === '@esbuild/linux-x64');
 
   assert.equal(dev.flags.dev, true);
   assert.equal(peer.flags.peer, true);
@@ -62,9 +72,9 @@ test('npm package flags and platform restrictions remain explicit', () => {
 
 test('npm non-registry sources receive explicit classifications', () => {
   const packages = parse().packages;
-  const kind = name => packages.find(pkg => pkg.name === name).sourceKind;
+  const kind = (name: string) => packageBy(packages, pkg => pkg.name === name).sourceKind;
 
-  const workspaceLink = packages.find(pkg => pkg.key === 'node_modules/workspace-link');
+  const workspaceLink = packageBy(packages, pkg => pkg.key === 'node_modules/workspace-link');
   assert.equal(workspaceLink.sourceKind, 'local');
   assert.deepEqual(workspaceLink.aliases, ['workspace-link']);
   assert.equal(kind('local-file'), 'local');
@@ -73,14 +83,14 @@ test('npm non-registry sources receive explicit classifications', () => {
   assert.equal(kind('external-tarball'), 'external-url');
   assert.equal(kind('private-package'), 'external-url');
   assert.equal(kind('credential-url'), 'external-url');
-  assert.equal(packages.find(pkg => pkg.name === 'credential-url').resolved, 'https://registry.npmjs.org/credential-url/-/credential-url-1.0.0.tgz');
-  assert.doesNotMatch(JSON.stringify(packages.find(pkg => pkg.name === 'credential-url')), /secret/);
+  assert.equal(packageBy(packages, pkg => pkg.name === 'credential-url').resolved, 'https://registry.npmjs.org/credential-url/-/credential-url-1.0.0.tgz');
+  assert.doesNotMatch(JSON.stringify(packageBy(packages, pkg => pkg.name === 'credential-url')), /secret/);
 });
 
 test('npm git URLs remove credential and query data from persisted package records', () => {
   const lock = structuredClone(v3Lock);
   lock.packages['node_modules/git-source'].resolved = 'git+https://user:secret@github.com/acme/source.git?token=secret#commit';
-  const gitPackage = parse(lock).packages.find(pkg => pkg.name === 'git-source');
+  const gitPackage = packageBy(parse(lock).packages, pkg => pkg.name === 'git-source');
 
   assert.equal(gitPackage.sourceKind, 'external-url');
   assert.equal(gitPackage.resolved, 'git+https://github.com/acme/source.git');
@@ -88,10 +98,10 @@ test('npm git URLs remove credential and query data from persisted package recor
 });
 
 test('npm import rejects v1 and malformed package maps', () => {
-  assert.throws(() => parse({ ...v3Lock, lockfileVersion: 1 }), error => error.category === 'input');
-  assert.throws(() => parse({ ...v3Lock, packages: [] }), error => error.category === 'input');
+  assert.throws(() => parse({ ...v3Lock, lockfileVersion: 1 }), hasErrorCategory('input'));
+  assert.throws(() => parse({ ...v3Lock, packages: [] }), hasErrorCategory('input'));
   assert.throws(
     () => parse({ ...v3Lock, packages: { ...v3Lock.packages, 'node_modules/bad': { version: '../1' } } }),
-    error => error.category === 'input',
+    hasErrorCategory('input'),
   );
 });

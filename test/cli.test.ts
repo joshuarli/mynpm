@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { test } from 'vitest';
 import { fileURLToPath } from 'node:url';
+import { parseInventory } from '../src/inventory.ts';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const scratchRoot = join(repositoryRoot, '.work', 'tmp');
@@ -18,11 +19,11 @@ let yamlAvailable = true;
 try {
   await import('yaml');
 } catch (error) {
-  if (error.code === 'ERR_MODULE_NOT_FOUND') yamlAvailable = false;
+  if (error instanceof Error && 'code' in error && error.code === 'ERR_MODULE_NOT_FOUND') yamlAvailable = false;
   else throw error;
 }
 
-function withScratch(run) {
+function withScratch<A>(run: (directory: string) => A): A {
   mkdirSync(scratchRoot, { recursive: true });
   const directory = mkdtempSync(join(scratchRoot, 'mynpm-cli-'));
   try {
@@ -32,7 +33,7 @@ function withScratch(run) {
   }
 }
 
-function runCli(scratch, args, overrides = {}) {
+function runCli(scratch: string, args: string[], overrides: NodeJS.ProcessEnv = {}) {
   const temporaryDirectory = join(scratch, 'tmp');
   mkdirSync(temporaryDirectory, { recursive: true });
   return spawnSync(process.execPath, ['--experimental-strip-types', cliPath, ...args], {
@@ -91,7 +92,7 @@ test('import-lock writes a versioned inventory and plan observes it', () => with
   ]);
 
   assert.equal(imported.status, 0, imported.stderr);
-  const inventory = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8'));
+  const inventory = parseInventory(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8'));
   assert.equal(inventory.schemaVersion, 2);
   assert.equal(inventory.projects[0].id, 'web');
   assert.equal(inventory.projects[0].targets[0], 'linux-x64-gnu');
@@ -276,12 +277,12 @@ test('add strips caller auth and registry settings, resolves exact roots, and re
   assert.match(added.stdout, /npm@12\.2\.1/);
   const inventoryPath = join(stateDirectory, 'inventory.json');
   const inventoryBytes = readFileSync(inventoryPath);
-  const inventory = JSON.parse(inventoryBytes);
+  const inventory = parseInventory(inventoryBytes.toString('utf8'));
   assert.deepEqual(inventory.projects.map(project => project.targets[0]), ['linux-x64-gnu', 'mac-arm64']);
   assert.ok(inventory.projects.every(project => project.packageManagerPin === 'npm@12.2.1'));
   assert.ok(inventory.projects.every(project => project.packages.map(pkg => `${pkg.name}@${pkg.version}`).join(',') === 'sample-package@1.2.3,transitive@2.0.0'));
-  assert.ok(inventory.projects.every(project => project.snapshot.manifest.includes('"name": "mynpm-resolution"')));
-  assert.ok(inventory.projects.every(project => JSON.parse(project.snapshot.lockfile).lockfileVersion === 3));
+  assert.ok(inventory.projects.every(project => project.snapshot?.manifest?.includes('"name": "mynpm-resolution"') === true));
+  assert.ok(inventory.projects.every(project => project.snapshot !== null && JSON.parse(project.snapshot.lockfile).lockfileVersion === 3));
 
   const repeated = runCli(scratch, arguments_, environment);
   assert.equal(repeated.status, 0, repeated.stderr);
@@ -323,7 +324,10 @@ test('add with pnpm preserves peer-qualified snapshots and plain artifact keys',
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const project = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8')).projects[0];
+  const project = parseInventory(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8')).projects[0];
+  assert.ok(project);
+  assert.ok(project.snapshot);
+  assert.ok(project.snapshot.manifest);
   assert.equal(project.roots[0].packageKey, '@effect/vitest@4.0.5');
   assert.ok(project.packages.some(pkg => pkg.key === '@effect/vitest@4.0.5'));
   assert.ok(project.snapshot.lockfile.includes('@effect/vitest@4.0.5(effect@4.0.5)(vitest@'));

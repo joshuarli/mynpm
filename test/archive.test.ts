@@ -1,17 +1,16 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { it } from '@effect/vitest';
 import { Effect } from 'effect';
 import { fileURLToPath } from 'node:url';
 import { inspectPackageArchive } from '../src/archive.ts';
+import { withScratch } from './support.ts';
 
-const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
-const scratchRoot = join(repositoryRoot, '.work', 'tmp');
 const validArchive = fileURLToPath(new URL('./fixtures/tarballs/flatdemo-1.2.3.tgz', import.meta.url));
 
-function tarMember(name, content = Buffer.alloc(0), type = '0') {
+function tarMember(name: string, content: Uint8Array = Buffer.alloc(0), type = '0') {
   const header = Buffer.alloc(512);
   header.write(name, 0, 100, 'utf8');
   header.write('0000644\0', 100, 8, 'ascii');
@@ -26,21 +25,13 @@ function tarMember(name, content = Buffer.alloc(0), type = '0') {
   const checksum = header.reduce((sum, byte) => sum + byte, 0);
   header.write(checksum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
   const paddedContent = Buffer.alloc(Math.ceil(content.length / 512) * 512);
-  content.copy(paddedContent);
+  Buffer.from(content).copy(paddedContent);
   return Buffer.concat([header, paddedContent]);
 }
 
-function createTar(entries) {
+function createTar(entries: { name: string; content?: Uint8Array; type?: string }[]) {
   const content = Buffer.concat([...entries.map(entry => tarMember(entry.name, entry.content, entry.type)), Buffer.alloc(1024)]);
   return gzipSync(content);
-}
-
-function withScratch(run) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => mkdtempSync(join(scratchRoot, 'archive-'))),
-    run,
-    directory => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
-  );
 }
 
 it.effect('archive inspection accepts the expected package and reports bounded contents', () => Effect.gen(function*() {

@@ -104,7 +104,7 @@ jobs:
           TMPDIR: ${{ github.workspace }}/.work/tmp
           npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
           MYNPM_REQUIRE_STATIC_CLIENTS: '1'
-        run: pnpm exec vitest run test/publish.test.mjs test/validate.test.mjs
+        run: pnpm exec vitest run test/publish.test.ts test/validate.test.ts
 
   egress-enforced:
     runs-on: ubuntu-24.04
@@ -164,7 +164,7 @@ jobs:
               test "$(pnpm --version)" = "12.15.0"
               node -e "console.log(JSON.stringify({node: process.version, platform: process.platform, arch: process.arch}))"
               node -e "const net=require(\"node:net\"); const socket=net.createConnection({host:\"1.1.1.1\",port:53}); const timer=setTimeout(()=>{socket.destroy();process.exit(1)},1500); socket.once(\"connect\",()=>{clearTimeout(timer);socket.destroy();process.exit(1)});socket.once(\"error\",()=>{clearTimeout(timer);process.exit(0)})"
-              node node_modules/vitest/vitest.mjs run test/publish.test.mjs test/validate.test.mjs
+              node node_modules/vitest/vitest.mjs run test/publish.test.ts test/validate.test.ts
             '
 
   public-smoke:

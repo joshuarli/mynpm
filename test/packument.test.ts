@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'vitest';
+import type { JsonObject, PackumentMetadata, VerifiedVersionMetadata } from '../src/inventory.ts';
 import { renderPackumentFiles } from '../src/packument.ts';
 
-function artifactRecord(name, version, bytes, packument, metadataOverrides = {}) {
+function artifactRecord(name: string, version: string, bytes: Buffer, packument: PackumentMetadata, metadataOverrides: JsonObject = {}) {
   const sha512 = createHash('sha512').update(bytes).digest('hex');
   const shasum = createHash('sha1').update(bytes).digest('hex');
   const packagePath = name.startsWith('@') ? `${name.slice(0, name.indexOf('/'))}%2f${name.slice(name.indexOf('/') + 1)}` : name;
@@ -38,7 +39,7 @@ function artifactRecord(name, version, bytes, packument, metadataOverrides = {})
     name,
     version,
     packument,
-    metadata,
+    metadata: metadata as VerifiedVersionMetadata,
     artifact: {
       sha512,
       integrity: `sha512-${Buffer.from(sha512, 'hex').toString('base64')}`,

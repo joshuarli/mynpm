@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import { parseConfig } from '../src/config.ts';
+import { MynpmError } from '../src/errors.ts';
+import { hasErrorCategory } from './support.ts';
 
 const baseConfig = {
   schemaVersion: 1,
@@ -17,9 +19,11 @@ const baseConfig = {
   },
 };
 
-function parse(overrides = {}) {
+function parse(overrides: Record<string, unknown> = {}) {
   return parseConfig(JSON.stringify({ ...baseConfig, ...overrides }));
 }
+
+const inputError = (error: unknown): boolean => error instanceof MynpmError && error.category === 'input';
 
 test('config accepts the exact schema and freezes validated values', () => {
   const config = parse();
@@ -32,44 +36,44 @@ test('config accepts the exact schema and freezes validated values', () => {
 });
 
 test('config rejects unknown top-level fields and schema versions', () => {
-  assert.throws(() => parse({ extra: true }), error => error.category === 'input');
-  assert.throws(() => parse({ schemaVersion: 2 }), error => error.category === 'input');
+  assert.throws(() => parse({ extra: true }), inputError);
+  assert.throws(() => parse({ schemaVersion: 2 }), inputError);
 });
 
 test('config rejects private registries and unsafe publication URLs', () => {
   assert.throws(
     () => parse({ upstreamRegistry: 'https://registry.example.net/' }),
-    error => error.category === 'input',
+    inputError,
   );
   assert.throws(
     () => parse({ publicBaseUrl: 'http://deps.example.net/mirror/' }),
-    error => error.category === 'input',
+    inputError,
   );
   assert.throws(
     () => parse({ publicBaseUrl: 'https://user:pass@deps.example.net/mirror/' }),
-    error => error.category === 'input',
+    inputError,
   );
 });
 
 test('config rejects unsupported, duplicate, and malformed targets', () => {
   assert.throws(
     () => parse({ targets: [{ id: 'windows-x64', os: 'win32', cpu: 'x64', node: '26.12.0' }] }),
-    error => error.category === 'input',
+    inputError,
   );
   assert.throws(
     () => parse({ targets: [baseConfig.targets[0], baseConfig.targets[0]] }),
-    error => error.category === 'input',
+    inputError,
   );
   assert.throws(
     () => parse({ targets: [{ ...baseConfig.targets[1], libc: 'musl', extra: true }] }),
-    error => error.category === 'input',
+    hasErrorCategory('input'),
   );
 });
 
 test('config rejects malformed JSON and policy values', () => {
-  assert.throws(() => parseConfig('{'), error => error.category === 'input');
+  assert.throws(() => parseConfig('{'), inputError);
   assert.throws(
     () => parse({ policy: { ...baseConfig.policy, externalSources: 'allow' } }),
-    error => error.category === 'input',
+    inputError,
   );
 });
