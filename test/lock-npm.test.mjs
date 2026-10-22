@@ -75,6 +75,16 @@ test('npm non-registry sources receive explicit classifications', () => {
   assert.doesNotMatch(JSON.stringify(packages.find(pkg => pkg.name === 'credential-url')), /secret/);
 });
 
+test('npm git URLs remove credential and query data from persisted package records', () => {
+  const lock = structuredClone(v3Lock);
+  lock.packages['node_modules/git-source'].resolved = 'git+https://user:secret@github.com/acme/source.git?token=secret#commit';
+  const gitPackage = parse(lock).packages.find(pkg => pkg.name === 'git-source');
+
+  assert.equal(gitPackage.sourceKind, 'external-url');
+  assert.equal(gitPackage.resolved, 'git+https://github.com/acme/source.git');
+  assert.doesNotMatch(JSON.stringify(gitPackage), /secret/);
+});
+
 test('npm import rejects v1 and malformed package maps', () => {
   assert.throws(() => parse({ ...v3Lock, lockfileVersion: 1 }), error => error.category === 'input');
   assert.throws(() => parse({ ...v3Lock, packages: [] }), error => error.category === 'input');

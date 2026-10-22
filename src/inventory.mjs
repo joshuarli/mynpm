@@ -6,6 +6,7 @@ const versionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A
 const sourceKinds = new Set(['registry', 'local', 'git', 'external-url', 'unknown']);
 const managers = new Set(['npm', 'pnpm']);
 const groups = new Set(['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']);
+const inventorySchemaVersion = 2;
 const integrityLengths = new Map([['sha1', 20], ['sha256', 32], ['sha384', 48], ['sha512', 64]]);
 const packageManagerPinPattern = /^(npm|pnpm)@((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?)(?:\+sha512\.[A-Za-z0-9+/=_-]+)?$/;
 const sha512Pattern = /^[a-f0-9]{128}$/;
@@ -39,6 +40,11 @@ function requireText(value, label, category) {
   return value;
 }
 
+function requireContents(value, label, category) {
+  if (typeof value !== 'string') invalid(`${label} must be a string`, category);
+  return value;
+}
+
 function requireList(value, label, category, allowEmpty = false) {
   if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) {
     invalid(`${label} must be ${allowEmpty ? 'an' : 'a non-empty'} array`, category);
@@ -62,6 +68,73 @@ function normalizeImporter(value, label, category) {
     invalid(`${label} must be a safe project-relative path`, category);
   }
   return importer;
+}
+
+function normalizeSnapshotPath(value, label, category) {
+  const path = requireText(value, label, category);
+  if (path.startsWith('/') || path.includes('\\') || path.split('/').some(part => part === '' || part === '.' || part === '..')) {
+    invalid(`${label} must be a safe project-relative path`, category);
+  }
+  return path;
+}
+
+function normalizeSnapshot(value, label, category, manager, lockfileVersion) {
+  if (value === null) return null;
+  requireRecord(value, label, category);
+  exactKeys(value, ['manifest', 'lockfile', 'workspaceFiles'], label, category);
+  const manifest = value.manifest;
+  if (manifest !== null) {
+    requireContents(manifest, `${label}.manifest`, category);
+    let parsedManifest;
+    try {
+      parsedManifest = JSON.parse(manifest);
+    } catch (cause) {
+      throw new MynpmError(category, `${label}.manifest is not valid JSON`, { cause });
+    }
+    if (!isRecord(parsedManifest)) invalid(`${label}.manifest must contain an object`, category);
+  }
+  const lockfile = requireContents(value.lockfile, `${label}.lockfile`, category);
+  if (lockfile.length === 0) invalid(`${label}.lockfile must not be empty`, category);
+  if (manager === 'npm') {
+    let parsedLockfile;
+    try {
+      parsedLockfile = JSON.parse(lockfile);
+    } catch (cause) {
+      throw new MynpmError(category, `${label}.lockfile is not valid JSON`, { cause });
+    }
+    if (!isRecord(parsedLockfile) || parsedLockfile.lockfileVersion !== lockfileVersion) {
+      invalid(`${label}.lockfile does not match its npm project`, category);
+    }
+  }
+  if (!Array.isArray(value.workspaceFiles)) invalid(`${label}.workspaceFiles must be an array`, category);
+  const workspaceFiles = value.workspaceFiles.map((file, index) => {
+    const fileLabel = `${label}.workspaceFiles[${index}]`;
+    requireRecord(file, fileLabel, category);
+    exactKeys(file, ['path', 'contents'], fileLabel, category);
+    const path = normalizeSnapshotPath(file.path, `${fileLabel}.path`, category);
+    if (!path.endsWith('/package.json') && !(manager === 'pnpm' && path === 'pnpm-workspace.yaml')) {
+      invalid(`${fileLabel}.path is not a workspace manifest or pnpm workspace configuration`, category);
+    }
+    if (path === 'package.json' || path === (manager === 'npm' ? 'package-lock.json' : 'pnpm-lock.yaml')) {
+      invalid(`${fileLabel}.path duplicates a project snapshot file`, category);
+    }
+    const contents = requireContents(file.contents, `${fileLabel}.contents`, category);
+    if (path.endsWith('/package.json')) {
+      let parsedManifest;
+      try {
+        parsedManifest = JSON.parse(contents);
+      } catch (cause) {
+        throw new MynpmError(category, `${fileLabel}.contents is not valid JSON`, { cause });
+      }
+      if (!isRecord(parsedManifest)) invalid(`${fileLabel}.contents must contain an object`, category);
+    }
+    return { path, contents };
+  });
+  workspaceFiles.sort((left, right) => left.path.localeCompare(right.path));
+  if (new Set(workspaceFiles.map(file => file.path)).size !== workspaceFiles.length) {
+    invalid(`${label}.workspaceFiles contains duplicate paths`, category);
+  }
+  return { manifest, lockfile, workspaceFiles };
 }
 
 function validateIntegrity(value, label, category) {
@@ -253,7 +326,7 @@ function normalizeRoot(value, label, category) {
 
 function normalizeProject(value, label, category) {
   requireRecord(value, label, category);
-  exactKeys(value, ['id', 'manager', 'packageManagerPin', 'lockfilePath', 'lockfileVersion', 'targets', 'roots', 'packages'], label, category);
+  exactKeys(value, ['id', 'manager', 'packageManagerPin', 'lockfilePath', 'lockfileVersion', 'targets', 'importers', 'roots', 'packages', 'snapshot'], label, category);
   const manager = requireText(value.manager, `${label}.manager`, category);
   if (!managers.has(manager)) invalid(`${label}.manager is unsupported`, category);
   const packageManagerPin = requireNullableText(value.packageManagerPin, `${label}.packageManagerPin`, category);
@@ -270,6 +343,9 @@ function normalizeProject(value, label, category) {
   if (!Array.isArray(value.roots) || !Array.isArray(value.packages)) invalid(`${label} roots and packages must be arrays`, category);
   const roots = value.roots.map((root, index) => normalizeRoot(root, `${label}.roots[${index}]`, category));
   roots.sort((left, right) => left.importer.localeCompare(right.importer) || left.group.localeCompare(right.group) || left.requestedName.localeCompare(right.requestedName) || left.specifier.localeCompare(right.specifier));
+  const importers = requireList(value.importers, `${label}.importers`, category, true)
+    .map((importer, index) => normalizeImporter(importer, `${label}.importers[${index}]`, category));
+  if (roots.some(root => !importers.includes(root.importer))) invalid(`${label}.roots references an unknown importer`, category);
   const packages = value.packages.map((pkg, index) => normalizePackage(pkg, `${label}.packages[${index}]`, category));
   packages.sort((left, right) => left.key.localeCompare(right.key) || left.name.localeCompare(right.name) || String(left.version).localeCompare(String(right.version)));
   const packageKeys = packages.map(pkg => pkg.key);
@@ -281,8 +357,10 @@ function normalizeProject(value, label, category) {
     lockfilePath: requireText(value.lockfilePath, `${label}.lockfilePath`, category),
     lockfileVersion: value.lockfileVersion,
     targets: requireList(value.targets, `${label}.targets`, category),
+    importers,
     roots,
     packages,
+    snapshot: normalizeSnapshot(value.snapshot, `${label}.snapshot`, category, manager, value.lockfileVersion),
   };
 }
 
@@ -364,7 +442,7 @@ function freezeDeep(value) {
 }
 
 export function createEmptyInventory() {
-  return freezeDeep({ schemaVersion: 1, projects: [], artifacts: [] });
+  return freezeDeep({ schemaVersion: inventorySchemaVersion, projects: [], artifacts: [] });
 }
 
 export function parseInventory(text) {
@@ -376,7 +454,7 @@ export function parseInventory(text) {
   }
   requireRecord(value, 'inventory', 'corrupt');
   exactKeys(value, ['schemaVersion', 'projects', 'artifacts'], 'inventory', 'corrupt');
-  if (value.schemaVersion !== 1) invalid(`unsupported inventory schemaVersion: ${String(value.schemaVersion)}`, 'corrupt');
+  if (value.schemaVersion !== inventorySchemaVersion) invalid(`unsupported inventory schemaVersion: ${String(value.schemaVersion)}`, 'corrupt');
   if (!Array.isArray(value.projects) || !Array.isArray(value.artifacts)) invalid('inventory projects and artifacts must be arrays', 'corrupt');
   const projects = value.projects.map((project, index) => normalizeProject(project, `inventory.projects[${index}]`, 'corrupt'));
   projects.sort((left, right) => left.id.localeCompare(right.id) || left.lockfilePath.localeCompare(right.lockfilePath) || left.manager.localeCompare(right.manager) || String(left.lockfileVersion).localeCompare(String(right.lockfileVersion)) || left.targets.join(',').localeCompare(right.targets.join(',')));
@@ -387,7 +465,7 @@ export function parseInventory(text) {
   validateDigestConflicts(projects, artifacts, 'corrupt');
   const identities = projects.map(stableStringify);
   if (new Set(identities).size !== identities.length) invalid('inventory contains duplicate project imports', 'corrupt');
-  return freezeDeep({ schemaVersion: 1, projects, artifacts });
+  return freezeDeep({ schemaVersion: inventorySchemaVersion, projects, artifacts });
 }
 
 export function mergeProject(inventory, project) {
@@ -398,7 +476,7 @@ export function mergeProject(inventory, project) {
   if (checkedInventory.projects.some(existing => stableStringify(existing) === stableStringify(checkedProject))) return checkedInventory;
   const projects = [...checkedInventory.projects, checkedProject];
   validateDigestConflicts(projects, checkedInventory.artifacts, 'conflict');
-  return parseInventory(JSON.stringify({ schemaVersion: 1, projects, artifacts: checkedInventory.artifacts }));
+  return parseInventory(JSON.stringify({ schemaVersion: inventorySchemaVersion, projects, artifacts: checkedInventory.artifacts }));
 }
 
 export function recordVerifiedArtifact(inventory, value) {
@@ -413,7 +491,7 @@ export function recordVerifiedArtifact(inventory, value) {
   }
   const artifacts = existing ? checkedInventory.artifacts : [...checkedInventory.artifacts, checkedArtifact];
   validateDigestConflicts(checkedInventory.projects, artifacts, 'conflict');
-  return parseInventory(JSON.stringify({ schemaVersion: 1, projects: checkedInventory.projects, artifacts }));
+  return parseInventory(JSON.stringify({ schemaVersion: inventorySchemaVersion, projects: checkedInventory.projects, artifacts }));
 }
 
 export function serializeInventory(inventory) {

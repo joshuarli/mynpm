@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
@@ -83,7 +83,7 @@ test('import-lock writes a versioned inventory and plan observes it', () => with
 
   assert.equal(imported.status, 0, imported.stderr);
   const inventory = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8'));
-  assert.equal(inventory.schemaVersion, 1);
+  assert.equal(inventory.schemaVersion, 2);
   assert.equal(inventory.projects[0].id, 'web');
   assert.equal(inventory.projects[0].targets[0], 'linux-x64-gnu');
 
@@ -97,10 +97,13 @@ test('import-lock writes a versioned inventory and plan observes it', () => with
 
 test('import-lock honors and records the project package manager pin', () => withScratch(scratch => {
   const projectDirectory = join(scratch, 'project');
-  mkdirSync(projectDirectory);
+  mkdirSync(join(projectDirectory, 'packages', 'workspace'), { recursive: true });
   const projectLockPath = join(projectDirectory, 'package-lock.json');
   writeFileSync(projectLockPath, readFileSync(lockfilePath));
-  writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web","packageManager":"npm@12.2.1"}\n');
+  const manifest = '{"name":"web","packageManager":"npm@12.2.1"}\n';
+  const workspaceManifest = '{"name":"workspace-link","version":"1.0.0"}\n';
+  writeFileSync(join(projectDirectory, 'package.json'), manifest);
+  writeFileSync(join(projectDirectory, 'packages', 'workspace', 'package.json'), workspaceManifest);
   const stateDirectory = join(scratch, 'state');
 
   const result = runCli(scratch, [
@@ -116,6 +119,9 @@ test('import-lock honors and records the project package manager pin', () => wit
   assert.match(result.stdout, /Package manager pin: npm@12\.2\.1/);
   const inventory = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8'));
   assert.equal(inventory.projects[0].packageManagerPin, 'npm@12.2.1');
+  assert.equal(inventory.projects[0].snapshot.manifest, manifest);
+  assert.deepEqual(inventory.projects[0].snapshot.workspaceFiles, [{ path: 'packages/workspace/package.json', contents: workspaceManifest }]);
+  assert.doesNotMatch(inventory.projects[0].snapshot.lockfile, /user:secret|token=secret/);
 
   writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web","packageManager":"pnpm@12.15.0"}\n');
   const mismatch = runCli(scratch, [
@@ -128,6 +134,30 @@ test('import-lock honors and records the project package manager pin', () => wit
   ]);
   assert.equal(mismatch.status, 2);
   assert.match(mismatch.stderr, /does not match npm lockfile/);
+}));
+
+test('import-lock rejects symlinked workspace snapshot paths', () => withScratch(scratch => {
+  const projectDirectory = join(scratch, 'project');
+  const outsideDirectory = join(scratch, 'outside');
+  mkdirSync(projectDirectory);
+  mkdirSync(outsideDirectory);
+  writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web"}\n');
+  writeFileSync(join(projectDirectory, 'package-lock.json'), readFileSync(lockfilePath));
+  writeFileSync(join(outsideDirectory, 'package.json'), '{"name":"outside"}\n');
+  mkdirSync(join(projectDirectory, 'packages'));
+  symlinkSync(outsideDirectory, join(projectDirectory, 'packages', 'workspace'));
+
+  const result = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', join(scratch, 'state'),
+    'import-lock',
+    join(projectDirectory, 'package-lock.json'),
+    '--project', 'web',
+  ]);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /project snapshot path is not a regular directory/);
+  assert.equal(readFileSync(join(outsideDirectory, 'package.json'), 'utf8'), '{"name":"outside"}\n');
 }));
 
 test('CLI maps usage, invalid input, and corrupt state to the specified exit codes', () => withScratch(scratch => {
@@ -216,6 +246,8 @@ test('add strips caller auth and registry settings, resolves exact roots, and re
   assert.deepEqual(inventory.projects.map(project => project.targets[0]), ['linux-x64-gnu', 'mac-arm64']);
   assert.ok(inventory.projects.every(project => project.packageManagerPin === 'npm@12.2.1'));
   assert.ok(inventory.projects.every(project => project.packages.map(pkg => `${pkg.name}@${pkg.version}`).join(',') === 'sample-package@1.2.3,transitive@2.0.0'));
+  assert.ok(inventory.projects.every(project => project.snapshot.manifest.includes('"name": "mynpm-resolution"')));
+  assert.ok(inventory.projects.every(project => JSON.parse(project.snapshot.lockfile).lockfileVersion === 3));
 
   const repeated = runCli(scratch, arguments_, environment);
   assert.equal(repeated.status, 0, repeated.stderr);

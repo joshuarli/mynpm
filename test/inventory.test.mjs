@@ -20,7 +20,7 @@ test('inventory is versioned and round-trips in stable JSON form', () => {
 
   assert.equal(serialized.endsWith('\n'), true);
   assert.deepEqual(parseInventory(serialized), inventory);
-  assert.equal(inventory.schemaVersion, 1);
+  assert.equal(inventory.schemaVersion, 2);
 });
 
 test('inventory imports are idempotent and conflicting digests fail', () => {
@@ -36,12 +36,35 @@ test('inventory imports are idempotent and conflicting digests fail', () => {
 });
 
 test('inventory rejects unknown schema versions and malformed fields', () => {
-  assert.throws(() => parseInventory('{"schemaVersion":2,"projects":[]}'), error => error.category === 'corrupt');
-  assert.throws(() => parseInventory('{"schemaVersion":1,"projects":[],"extra":true}'), error => error.category === 'corrupt');
+  assert.throws(() => parseInventory('{"schemaVersion":1,"projects":[],"artifacts":[]}'), error => error.category === 'corrupt');
+  assert.throws(() => parseInventory('{"schemaVersion":2,"projects":[],"artifacts":[],"extra":true}'), error => error.category === 'corrupt');
   assert.throws(() => parseInventory('{'), error => error.category === 'corrupt');
   const invalidImporter = structuredClone(mergeProject(createEmptyInventory(), project()));
   invalidImporter.projects[0].roots[0].importer = '../outside';
   assert.throws(() => parseInventory(JSON.stringify(invalidImporter)), error => error.category === 'corrupt');
+});
+
+test('inventory retains immutable project snapshots and rejects unsafe snapshot paths', () => {
+  const imported = project();
+  const snapshot = {
+    manifest: '{"name":"web"}\n',
+    lockfile: `${JSON.stringify(lock)}\n`,
+    workspaceFiles: [{ path: 'packages/web/package.json', contents: '{"name":"web"}\n' }],
+  };
+  const inventory = mergeProject(createEmptyInventory(), { ...imported, snapshot });
+  assert.deepEqual(inventory.projects[0].snapshot, snapshot);
+
+  const unsafe = structuredClone(inventory);
+  unsafe.projects[0].snapshot.workspaceFiles[0].path = '../package.json';
+  assert.throws(() => parseInventory(JSON.stringify(unsafe)), error => error.category === 'corrupt');
+
+  const unknownImporter = structuredClone(inventory);
+  unknownImporter.projects[0].importers = [];
+  assert.throws(() => parseInventory(JSON.stringify(unknownImporter)), error => error.category === 'corrupt');
+
+  const unexpectedFile = structuredClone(inventory);
+  unexpectedFile.projects[0].snapshot.workspaceFiles.push({ path: '.npmrc', contents: 'registry=https://example.invalid/' });
+  assert.throws(() => parseInventory(JSON.stringify(unexpectedFile)), error => error.category === 'corrupt');
 });
 
 test('inventory records matching verified metadata and rejects divergent artifact identities', () => {

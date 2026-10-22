@@ -51,7 +51,7 @@ test('pnpm two-document YAML preserves manager and project packages for doctor a
   assert.deepEqual(await pnpmBuildPackageKeys(text), ['private-download@1.0.0']);
 });
 
-test('pnpm documents union packages, roots, aliases, and peer instances', () => {
+test('pnpm documents union packages, roots, aliases, and peer-context snapshots', () => {
   const documents = [
     {
       lockfileVersion: '9.0',
@@ -84,12 +84,15 @@ test('pnpm documents union packages, roots, aliases, and peer instances', () => 
         },
       },
       packages: {
-        '@scope/app@2.0.0(peer-base@1.0.0)': { resolution: { integrity } },
+        '@scope/app@2.0.0': { resolution: { integrity } },
         'peer-base@1.0.0': { resolution: { integrity } },
+        'another-peer@1.0.0': { resolution: { integrity } },
       },
       snapshots: {
         '@scope/app@2.0.0(peer-base@1.0.0)': { dependencies: { 'peer-base': '1.0.0' } },
+        '@scope/app@2.0.0(another-peer@1.0.0)': { dependencies: { 'another-peer': '1.0.0' } },
         'peer-base@1.0.0': {},
+        'another-peer@1.0.0': {},
       },
     },
   ];
@@ -102,7 +105,8 @@ test('pnpm documents union packages, roots, aliases, and peer instances', () => 
   const alias = project.roots.find(root => root.requestedName === 'alias-app');
   const optional = project.packages.find(pkg => pkg.name === 'native-optional');
 
-  assert.equal(project.packages.length, 4);
+  assert.equal(project.packages.length, 5);
+  assert.equal(project.packages.filter(pkg => pkg.name === '@scope/app').length, 1);
   assert.deepEqual(alias, {
     importer: '.',
     requestedName: 'alias-app',
@@ -110,7 +114,7 @@ test('pnpm documents union packages, roots, aliases, and peer instances', () => 
     packageName: '@scope/app',
     packageVersion: '2.0.0',
     group: 'dependencies',
-    packageKey: '@scope/app@2.0.0(peer-base@1.0.0)',
+    packageKey: '@scope/app@2.0.0',
   });
   assert.deepEqual(optional.platform.os, ['darwin']);
   assert.deepEqual(optional.targets, ['linux-x64-gnu', 'mac-arm64']);
@@ -124,6 +128,7 @@ test('pnpm importer paths stay with their roots', () => {
       'packages/web': {
         dependencies: { 'peer-base': { specifier: '1.0.0', version: '1.0.0' } },
       },
+      'packages/empty': {},
     },
     packages: { 'peer-base@1.0.0': { resolution: { integrity } } },
     snapshots: { 'peer-base@1.0.0': {} },
@@ -134,6 +139,7 @@ test('pnpm importer paths stay with their roots', () => {
   });
 
   assert.equal(project.roots[0].importer, 'packages/web');
+  assert.deepEqual(project.importers, ['packages/empty', 'packages/web']);
 });
 
 test('pnpm rejects unsupported revisions, unmatched snapshots, and conflicting documents', () => {

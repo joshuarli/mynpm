@@ -13,6 +13,7 @@ import { publishSite } from './publish.mjs';
 import { validateInventory } from './validate.mjs';
 import { isIP } from 'node:net';
 import { pnpmBuildPackageKeys } from './lock-pnpm.mjs';
+import { captureProjectSnapshot } from './project-snapshot.mjs';
 
 const commands = new Set(['import-lock', 'add', 'plan', 'fetch', 'verify', 'publish', 'validate', 'doctor']);
 const valueOptions = new Set(['--config', '--state-dir', '--site-dir', '--target', '--project', '--manager', '--client']);
@@ -142,19 +143,25 @@ async function importLock(arguments_, config, cwd) {
   if (packageManagerPin && packageManagerPin.manager !== lockManager) {
     throw new MynpmError('input', `packageManager pin ${packageManagerPin.raw} does not match ${lockManager} lockfile`);
   }
-  const project = /\.ya?ml$/i.test(lockfilePath)
-    ? await parsePnpmLock(text, {
-      projectId: arguments_.project,
-      packageManagerPin: packageManagerPin?.raw ?? null,
-      lockfilePath: relative(cwd, lockfilePath).split(sep).join('/'),
-      targetIds: targetIdsFor(config, arguments_.targets),
-    })
-    : parseNpmLock(parseJsonLock(text, lockfilePath), {
-      projectId: arguments_.project,
-      packageManagerPin: packageManagerPin?.raw ?? null,
-      lockfilePath: relative(cwd, lockfilePath).split(sep).join('/'),
-      targetIds: targetIdsFor(config, arguments_.targets),
-    });
+  const options = {
+    projectId: arguments_.project,
+    packageManagerPin: packageManagerPin?.raw ?? null,
+    lockfilePath: relative(cwd, lockfilePath).split(sep).join('/'),
+    targetIds: targetIdsFor(config, arguments_.targets),
+  };
+  const parsedLock = lockManager === 'npm' ? parseJsonLock(text, lockfilePath) : null;
+  const parseProject = snapshot => lockManager === 'pnpm'
+    ? parsePnpmLock(text, { ...options, snapshot })
+    : parseNpmLock(parsedLock, { ...options, snapshot });
+  const initialProject = await parseProject(null);
+  const snapshot = await captureProjectSnapshot({
+    manager: lockManager,
+    projectDirectory: dirname(lockfilePath),
+    lockfileText: text,
+    lock: parsedLock,
+    project: initialProject,
+  });
+  const project = await parseProject(snapshot);
   const stateDirectory = resolve(cwd, arguments_.statedir ?? 'state');
   await updateInventory(stateDirectory, inventory => mergeProject(inventory, project));
   process.stdout.write(`Imported ${project.packages.length} package entries for ${project.id} (${project.targets.join(', ')}).\n`);
@@ -395,7 +402,7 @@ async function execute(argv, signal) {
   }
   if (parsed.command === 'validate') {
     const result = await validateInventory({ client: parsed.client, stateDirectory, config, signal, cwd });
-    process.stdout.write(`Validated ${result.client}@${result.version} on Node ${result.nodeVersion} for ${result.target}: ${result.packageCount} package selections across ${result.projectCount} roots and ${result.requestCount} local HTTP requests.\n`);
+    process.stdout.write(`Restored ${result.client}@${result.version} on Node ${result.nodeVersion} for ${result.target}: ${result.packageCount} package selections across ${result.projectCount} projects and ${result.requestCount} local HTTP requests.\n`);
     for (const executable of result.executables) process.stdout.write(`Executed ${executable.name}: ${executable.output}\n`);
     return;
   }

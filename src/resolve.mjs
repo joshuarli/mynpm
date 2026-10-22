@@ -82,7 +82,8 @@ async function resolveTarget({ manager, roots, target, config, workspace, runtim
     packageManager: packageManagerPin,
     dependencies: Object.fromEntries(roots.map(root => [root.name, root.version])),
   };
-  await writeFile(join(projectDirectory, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
+  const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+  await writeFile(join(projectDirectory, 'package.json'), manifestText, { flag: 'wx' });
   const environment = toolEnvironment(workspace, target, config.upstreamRegistry, runtime);
   await ensureDirectory(environment.HOME);
   await ensureDirectory(environment.npm_config_cache);
@@ -119,6 +120,7 @@ async function resolveTarget({ manager, roots, target, config, workspace, runtim
     packageManagerPin,
     lockfilePath: `add/${manager}/${target.id}/${lockfileName}`,
     targetIds: [target.id],
+    snapshot: { manifest: manifestText, lockfile: lockText, workspaceFiles: [] },
   };
   const project = manager === 'npm'
     ? parseNpmLock(parseJson(lockText), parseOptions)

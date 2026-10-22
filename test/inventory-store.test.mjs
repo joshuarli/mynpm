@@ -25,11 +25,11 @@ test('inventory reads and writes reject symbolic-link files without following th
   try {
     const outside = join(directory, 'outside.json');
     const inventoryPath = join(directory, 'inventory.json');
-    writeFileSync(outside, '{"schemaVersion":1,"projects":[],"artifacts":[]}\n');
+    writeFileSync(outside, '{"schemaVersion":2,"projects":[],"artifacts":[]}\n');
     symlinkSync(outside, inventoryPath);
     await assert.rejects(loadInventory(directory), error => error.category === 'corrupt' && /symbolic link/.test(error.message));
     await assert.rejects(saveInventory(directory, createEmptyInventory()), error => error.category === 'corrupt');
-    assert.equal(readFileSync(outside, 'utf8'), '{"schemaVersion":1,"projects":[],"artifacts":[]}\n');
+    assert.equal(readFileSync(outside, 'utf8'), '{"schemaVersion":2,"projects":[],"artifacts":[]}\n');
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -80,7 +80,7 @@ test('inventory writes replace atomically and round-trip', async () => {
   try {
     await saveInventory(directory, createEmptyInventory());
     const inventoryPath = join(directory, 'inventory.json');
-    assert.equal(readFileSync(inventoryPath, 'utf8'), '{\n  "artifacts": [],\n  "projects": [],\n  "schemaVersion": 1\n}\n');
+    assert.equal(readFileSync(inventoryPath, 'utf8'), '{\n  "artifacts": [],\n  "projects": [],\n  "schemaVersion": 2\n}\n');
     assert.deepEqual(await loadInventory(directory), createEmptyInventory());
     assert.deepEqual(readdirSync(directory), ['inventory.json']);
   } finally {

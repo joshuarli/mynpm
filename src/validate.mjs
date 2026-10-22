@@ -42,32 +42,6 @@ function packageSlug(value) {
   return slug || 'project';
 }
 
-function importerRoots(project, importer) {
-  return project.roots.filter(root => root.importer === importer);
-}
-
-function buildManifest(project, roots, manager) {
-  const dependencies = {};
-  for (const root of roots) {
-    const group = dependencies[root.group] ?? {};
-    const specifier = root.requestedName === root.packageName
-      ? root.packageVersion
-      : `npm:${root.packageName}@${root.packageVersion}`;
-    if (Object.hasOwn(group, root.requestedName) && group[root.requestedName] !== specifier) {
-      fail('input', `validation found conflicting root specifiers for ${root.requestedName}`);
-    }
-    group[root.requestedName] = specifier;
-    dependencies[root.group] = group;
-  }
-  return {
-    name: `mynpm-validation-${packageSlug(project.id)}-${packageSlug(roots[0].importer)}`,
-    version: '1.0.0',
-    private: true,
-    packageManager: `${manager}@${managerVersions[manager]}`,
-    ...dependencies,
-  };
-}
-
 function integrityKey(value, artifactRecord, identity) {
   if (!artifactRecord) fail('corrupt', `no verified artifact is available for ${identity}`);
   const expected = new Map([['sha512', artifactRecord.artifact.sha512]]);
@@ -91,9 +65,6 @@ function packageSelection(project, target, artifacts, { allowLocalHost = false, 
   const artifactByIdentity = new Map(artifacts.map(record => [`${record.name}\0${record.version}`, record]));
   const selected = new Map();
   for (const item of project.packages) {
-    if (allowLocalHost && item.sourceKind === 'local' && item.version !== null) {
-      fail('conflict', `validation lock contains a local source for ${item.name}@${item.version}`);
-    }
     if (item.version === null || item.sourceKind === 'local' || !supportsTarget(item.platform, target)) continue;
     if (!allowLocalHost && item.sourceKind !== 'registry') continue;
     if (allowLocalHost) {
@@ -124,11 +95,6 @@ function compareSelections(expected, actual, projectId, manager) {
   if (missing.length > 0 || extra.length > 0) {
     fail('conflict', `${manager} validation changed package/version/integrity selections for ${projectId}; missing ${missing.length}, added ${extra.length}`);
   }
-}
-
-function unionSelections(selections) {
-  const unique = new Map(selections.map(item => [`${item.identity}\0${item.integrity}`, item]));
-  return [...unique.values()].sort((left, right) => left.identity.localeCompare(right.identity) || left.integrity.localeCompare(right.integrity));
 }
 
 function clientEnvironment(workspace, registry, cacheDirectory) {
@@ -243,50 +209,210 @@ async function checkClientVersion(client, target, cwd, environment, dependencies
   return version;
 }
 
-async function readLockSelection(manager, projectDirectory, projectId, target, localOrigin, artifacts) {
-  const fileName = manager === 'npm' ? 'package-lock.json' : 'pnpm-lock.yaml';
-  let text;
-  try {
-    text = await readFile(join(projectDirectory, fileName), 'utf8');
-  } catch (cause) {
-    throw new MynpmError('operation', `${manager} did not create ${fileName}`, { cause });
-  }
-  let project;
-  const options = { projectId, lockfilePath: fileName, targetIds: [target.id], packageManagerPin: `${manager}@${managerVersions[manager]}` };
-  if (manager === 'npm') {
-    try {
-      project = parseNpmLock(JSON.parse(text), options);
-    } catch (cause) {
-      if (cause instanceof MynpmError) throw cause;
-      throw new MynpmError('input', 'npm produced an invalid package-lock.json', { cause });
-    }
-  } else {
-    project = await parsePnpmLock(text, options);
-  }
-  return packageSelection(project, target, artifacts, { allowLocalHost: true, localOrigin });
+function canonicalValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalValue(value[key])]));
 }
 
-function projectGroups(project, target, manager) {
-  if (!project.targets.includes(target.id)) return [];
-  const unsupported = project.packages.find(item => item.version !== null && supportsTarget(item.platform, target) && item.sourceKind !== 'registry');
-  if (unsupported) fail('input', `validation rejects ${unsupported.sourceKind} source ${unsupported.name}${unsupported.version ? `@${unsupported.version}` : ''}`);
-  const importers = [...new Set(project.roots.map(root => root.importer))].sort();
-  const groups = [];
-  for (const importer of importers) {
-    const roots = importerRoots(project, importer);
-    if (roots.length === 0) continue;
-    for (const root of roots) {
-      const record = root.packageKey === null ? null : project.packages.find(item => item.key === root.packageKey);
-      if (record === null || record === undefined) {
-        fail('input', `validation cannot reproduce unresolved or local root ${root.requestedName} in ${project.id}`);
-      }
-      if (record.sourceKind !== 'registry' || record.version === null) {
-        fail('input', `validation rejects ${record.sourceKind} root ${record.name}${record.version ? `@${record.version}` : ''}`);
+function canonicalText(value) {
+  return JSON.stringify(canonicalValue(value));
+}
+
+async function pnpmDocuments(text) {
+  let yaml;
+  try {
+    yaml = await import('yaml');
+  } catch (cause) {
+    throw new MynpmError('operation', 'pnpm validation requires the pinned yaml@2.9.1 dependency; install locked project dependencies', { cause });
+  }
+  let documents;
+  try {
+    documents = yaml.parseAllDocuments(text, { uniqueKeys: true });
+  } catch (cause) {
+    throw new MynpmError('input', 'pnpm lockfile is not valid YAML', { cause });
+  }
+  const errors = documents.flatMap(document => document.errors);
+  if (errors.length > 0) throw new MynpmError('input', `pnpm lockfile contains invalid YAML: ${errors[0].message}`, { cause: errors[0] });
+  return { yaml, values: documents.map(document => document.toJS({ maxAliasCount: 100 })) };
+}
+
+async function parseProjectLock(manager, text, options) {
+  if (manager === 'npm') {
+    try {
+      return parseNpmLock(JSON.parse(text), options);
+    } catch (cause) {
+      if (cause instanceof MynpmError) throw cause;
+      throw new MynpmError('input', 'npm package-lock.json is not valid JSON', { cause });
+    }
+  }
+  return parsePnpmLock(text, options);
+}
+
+function projectWithoutSnapshot(project) {
+  return { ...project, snapshot: null };
+}
+
+function workspaceFileMap(snapshot) {
+  return new Map(snapshot.workspaceFiles.map(file => [file.path, file.contents]));
+}
+
+function safeLocalPath(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.replace(/^file:/, '').replace(/^\.\//, '');
+  if (normalized.startsWith('/') || normalized.includes('\\') || normalized.split('/').some(part => part === '' || part === '.' || part === '..')) return null;
+  return normalized;
+}
+
+async function assertSnapshotRestorable(project) {
+  const snapshot = project.snapshot;
+  if (snapshot === null || snapshot.manifest === null) fail('input', `validation requires an imported package.json snapshot for ${project.id}`);
+  const files = workspaceFileMap(snapshot);
+  if (project.manager === 'npm') {
+    const lock = JSON.parse(snapshot.lockfile);
+    for (const entry of Object.values(lock.packages ?? {})) {
+      if (entry?.link !== true || typeof entry.resolved !== 'string') continue;
+      const workspacePath = safeLocalPath(entry.resolved);
+      if (workspacePath === null || !files.has(`${workspacePath}/package.json`)) {
+        fail('input', `validation cannot restore local workspace ${entry.resolved} for ${project.id}`);
       }
     }
-    groups.push({ importer, roots, manifest: buildManifest(project, roots, manager) });
+    for (const item of project.packages) {
+      if (item.sourceKind === 'local' && item.flags.link !== true && item.version !== null) {
+        fail('input', `validation cannot restore local file package ${item.name}@${item.version} for ${project.id}`);
+      }
+    }
+  } else {
+    const importers = project.importers.filter(importer => importer !== '.');
+    for (const importer of importers) {
+      if (!files.has(`${importer}/package.json`)) fail('input', `validation cannot restore pnpm workspace importer ${importer} for ${project.id}`);
+    }
+    if (importers.length > 0 && !files.has('pnpm-workspace.yaml')) {
+      fail('input', `validation cannot restore pnpm workspace configuration for ${project.id}`);
+    }
+    for (const item of project.packages) {
+      if (item.sourceKind === 'local' && item.flags.link !== true && item.version !== null) {
+        fail('input', `validation cannot restore local pnpm package ${item.name}@${item.version} for ${project.id}`);
+      }
+    }
   }
-  return groups;
+}
+
+async function assertSnapshotMatchesProject(project, target) {
+  await assertSnapshotRestorable(project);
+  const restored = await parseProjectLock(project.manager, project.snapshot.lockfile, {
+    projectId: project.id,
+    packageManagerPin: project.packageManagerPin,
+    lockfilePath: project.lockfilePath,
+    targetIds: project.targets,
+    snapshot: null,
+  });
+  if (canonicalText(projectWithoutSnapshot(restored)) !== canonicalText(projectWithoutSnapshot(project))) {
+    fail('corrupt', `saved ${project.manager} lockfile no longer matches imported project ${project.id}`);
+  }
+  const manifest = JSON.parse(project.snapshot.manifest);
+  if ((manifest.packageManager ?? null) !== project.packageManagerPin) {
+    fail('corrupt', `saved package.json pin no longer matches imported project ${project.id}`);
+  }
+  const unsupported = project.packages.find(item => item.version !== null && supportsTarget(item.platform, target) && item.sourceKind !== 'registry' && item.sourceKind !== 'local');
+  if (unsupported) fail('input', `validation rejects ${unsupported.sourceKind} source ${unsupported.name}@${unsupported.version}`);
+}
+
+function packageArtifact(project, item, artifacts) {
+  const artifact = artifacts.find(record => record.name === item.name && record.version === item.version);
+  integrityKey(item.integrity, artifact, `${item.name}@${item.version}`);
+  return artifact;
+}
+
+function localTarballUrl(registry, digest) {
+  return new URL(`../tarballs/${digest}.tgz`, registry).href;
+}
+
+function rewriteNpmLock(project, target, artifacts, registry) {
+  const lock = JSON.parse(project.snapshot.lockfile);
+  for (const item of project.packages) {
+    if (item.version === null || !supportsTarget(item.platform, target) || item.sourceKind === 'local') continue;
+    if (item.sourceKind !== 'registry') fail('input', `validation cannot migrate ${item.sourceKind} source ${item.name}@${item.version}`);
+    const artifact = packageArtifact(project, item, artifacts);
+    const entry = lock.packages?.[item.key];
+    if (!entry || typeof entry !== 'object') fail('corrupt', `saved npm lockfile is missing ${item.key}`);
+    entry.resolved = localTarballUrl(registry, artifact.artifact.sha512);
+  }
+  return `${JSON.stringify(lock, null, 2)}\n`;
+}
+
+async function rewritePnpmLock(project, target, artifacts, registry) {
+  const { yaml, values } = await pnpmDocuments(project.snapshot.lockfile);
+  const packages = new Map(project.packages.map(item => [item.key, item]));
+  for (const document of values) {
+    for (const [key, entry] of Object.entries(document.packages ?? {})) {
+      const item = packages.get(key);
+      if (!item || item.version === null || !supportsTarget(item.platform, target) || item.sourceKind === 'local') continue;
+      if (item.sourceKind !== 'registry') fail('input', `validation cannot migrate ${item.sourceKind} source ${item.name}@${item.version}`);
+      const artifact = packageArtifact(project, item, artifacts);
+      entry.resolution.tarball = localTarballUrl(registry, artifact.artifact.sha512);
+    }
+  }
+  return values.map(value => yaml.stringify(value).trimEnd()).join('\n---\n') + '\n';
+}
+
+async function assertMigrationPreservesGraph(project, target, migratedLock) {
+  if (project.manager === 'npm') {
+    const original = JSON.parse(project.snapshot.lockfile);
+    const migrated = JSON.parse(migratedLock);
+    for (const item of project.packages) {
+      if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+      const originalEntry = original.packages?.[item.key];
+      const migratedEntry = migrated.packages?.[item.key];
+      if (!originalEntry || !migratedEntry) fail('corrupt', `saved npm lockfile is missing ${item.key}`);
+      originalEntry.resolved = 'mynpm-local-tarball';
+      migratedEntry.resolved = 'mynpm-local-tarball';
+    }
+    if (canonicalText(original) !== canonicalText(migrated)) fail('conflict', `registry migration changed the saved npm dependency graph for ${project.id}`);
+    return;
+  }
+  const original = (await pnpmDocuments(project.snapshot.lockfile)).values;
+  const migrated = (await pnpmDocuments(migratedLock)).values;
+  for (const item of project.packages) {
+    if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+    const originalEntries = original.map(document => document.packages?.[item.key]).filter(Boolean);
+    const migratedEntries = migrated.map(document => document.packages?.[item.key]).filter(Boolean);
+    if (originalEntries.length === 0 || migratedEntries.length === 0) fail('corrupt', `saved pnpm lockfile is missing ${item.name}@${item.version}`);
+    for (const entry of [...originalEntries, ...migratedEntries]) entry.resolution.tarball = 'mynpm-local-tarball';
+  }
+  if (canonicalText(original) !== canonicalText(migrated)) fail('conflict', `registry migration changed the saved pnpm dependency graph for ${project.id}`);
+}
+
+async function lockGraph(manager, text, project, target) {
+  if (manager === 'npm') {
+    let lock;
+    try {
+      lock = JSON.parse(text);
+    } catch (cause) {
+      throw new MynpmError('input', `npm package-lock.json is not valid JSON for ${project.id}`, { cause });
+    }
+    for (const item of project.packages) {
+      if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+      const entry = lock.packages?.[item.key];
+      if (!entry) fail('corrupt', `saved npm lockfile is missing ${item.key}`);
+      entry.resolved = 'mynpm-local-tarball';
+    }
+    return lock;
+  }
+  const { values } = await pnpmDocuments(text);
+  for (const item of project.packages) {
+    if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+    const entries = values.map(document => document.packages?.[item.key]).filter(Boolean);
+    if (entries.length === 0) fail('corrupt', `saved pnpm lockfile is missing ${item.key}`);
+    for (const entry of entries) entry.resolution.tarball = 'mynpm-local-tarball';
+  }
+  return values;
+}
+
+async function assertLockfileMatches(manager, expectedText, actualText, project, target) {
+  const expected = await lockGraph(manager, expectedText, project, target);
+  const actual = await lockGraph(manager, actualText, project, target);
+  if (canonicalText(expected) !== canonicalText(actual)) fail('conflict', `${manager} changed the saved dependency graph for ${project.id}`);
 }
 
 async function checkExecutables(projectDirectory, project, roots, target, environment, dependencies) {
@@ -316,41 +442,71 @@ async function checkExecutables(projectDirectory, project, roots, target, enviro
   return outputs;
 }
 
-async function installImporter({ client, project, group, target, workspace, registry, localOrigin, packageNumber, dependencies }) {
-  const projectDirectory = join(workspace, 'projects', `${packageSlug(project.id)}-${packageNumber}`);
+async function writeProjectSnapshot(projectDirectory, project, lockText, lockfileName) {
   await mkdir(projectDirectory, { recursive: true, mode: 0o700 });
-  const manifest = { ...group.manifest };
-  await writeFile(join(projectDirectory, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
-  const installWorkspace = join(workspace, 'clients', `${packageSlug(project.id)}-${packageNumber}`);
+  await writeFile(join(projectDirectory, 'package.json'), project.snapshot.manifest, { flag: 'wx' });
+  await writeFile(join(projectDirectory, lockfileName), lockText, { flag: 'wx' });
+  for (const file of project.snapshot.workspaceFiles) {
+    const filePath = join(projectDirectory, ...file.path.split('/'));
+    const parent = filePath.slice(0, filePath.lastIndexOf('/'));
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await writeFile(filePath, file.contents, { flag: 'wx' });
+  }
+}
+
+async function assertProjectFilesUnchanged(projectDirectory, project, lockfileName) {
+  const files = [
+    { path: 'package.json', contents: project.snapshot.manifest },
+    ...project.snapshot.workspaceFiles,
+  ];
+  for (const file of files) {
+    if (file.path === lockfileName) continue;
+    let actual;
+    try {
+      actual = await readFile(join(projectDirectory, ...file.path.split('/')), 'utf8');
+    } catch (cause) {
+      throw new MynpmError('operation', `client removed project snapshot file ${file.path} for ${project.id}`, { cause });
+    }
+    if (actual !== file.contents) fail('conflict', `${project.manager} changed project snapshot file ${file.path} for ${project.id}`);
+  }
+}
+
+async function installProject({ client, project, target, workspace, registry, localOrigin, projectNumber, dependencies }) {
+  const projectDirectory = join(workspace, 'projects', `${packageSlug(project.id)}-${projectNumber}`);
+  const installWorkspace = join(workspace, 'clients', `${packageSlug(project.id)}-${projectNumber}`);
   await mkdir(installWorkspace, { recursive: true, mode: 0o700 });
-  const initialCache = join(installWorkspace, 'cache-before-install');
-  const initialEnvironment = await createClientEnvironment(installWorkspace, registry, initialCache);
+  const lockfileName = client === 'npm' ? 'package-lock.json' : 'pnpm-lock.yaml';
+  const migratedLock = client === 'npm'
+    ? rewriteNpmLock(project, target, dependencies.artifacts, registry)
+    : await rewritePnpmLock(project, target, dependencies.artifacts, registry);
+  await assertMigrationPreservesGraph(project, target, migratedLock);
+  await writeProjectSnapshot(projectDirectory, project, migratedLock, lockfileName);
+  const cacheDirectory = join(installWorkspace, 'cache');
+  const environment = await createClientEnvironment(installWorkspace, registry, cacheDirectory);
   const run = dependencies.runProcess ?? runProcess;
-  if (client === 'npm') {
-    await run(client, [
-      'install', `--registry=${registry}`, `--cache=${initialCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0',
-    ], { cwd: projectDirectory, env: initialEnvironment, signal: dependencies.signal, timeoutMs: clientTimeoutMilliseconds });
-  } else {
-    await run(client, [
-      'install', '--lockfile-only', `--registry=${registry}`, `--store-dir=${join(installWorkspace, 'lockfile-store')}`, '--ignore-scripts',
-    ], { cwd: projectDirectory, env: initialEnvironment, signal: dependencies.signal, timeoutMs: clientTimeoutMilliseconds });
+  const args = client === 'npm'
+    ? ['ci', `--registry=${registry}`, `--cache=${cacheDirectory}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0']
+    : ['install', '--frozen-lockfile', `--registry=${registry}`, `--store-dir=${join(installWorkspace, 'pnpm-store')}`, '--ignore-scripts'];
+  await run(client, args, { cwd: projectDirectory, env: environment, signal: dependencies.signal, timeoutMs: clientTimeoutMilliseconds });
+  let actualLock;
+  try {
+    actualLock = await readFile(join(projectDirectory, lockfileName), 'utf8');
+  } catch (cause) {
+    throw new MynpmError('operation', `${client} removed ${lockfileName} while restoring ${project.id}`, { cause });
   }
-  const resolvedSelection = await readLockSelection(client, projectDirectory, `${project.id}-${group.importer}`, target, localOrigin, dependencies.artifacts);
-  if (client === 'npm') {
-    const cleanCache = join(installWorkspace, 'cache-ci');
-    const cleanEnvironment = await createClientEnvironment(installWorkspace, registry, cleanCache);
-    await run(client, [
-      'ci', `--registry=${registry}`, `--cache=${cleanCache}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0',
-    ], { cwd: projectDirectory, env: cleanEnvironment, signal: dependencies.signal, timeoutMs: clientTimeoutMilliseconds });
-  } else {
-    const cleanStore = join(installWorkspace, 'frozen-store');
-    const frozenEnvironment = await createClientEnvironment(installWorkspace, registry, join(installWorkspace, 'cache-frozen'));
-    await run(client, [
-      'install', '--frozen-lockfile', `--registry=${registry}`, `--store-dir=${cleanStore}`, '--ignore-scripts',
-    ], { cwd: projectDirectory, env: frozenEnvironment, signal: dependencies.signal, timeoutMs: clientTimeoutMilliseconds });
-  }
-  const executables = await checkExecutables(projectDirectory, project, group.roots, target, initialEnvironment, dependencies);
-  return { selection: resolvedSelection, executables };
+  const actualProject = await parseProjectLock(client, actualLock, {
+    projectId: project.id,
+    packageManagerPin: project.packageManagerPin,
+    lockfilePath: lockfileName,
+    targetIds: [target.id],
+    snapshot: null,
+  });
+  await assertLockfileMatches(client, migratedLock, actualLock, project, target);
+  const selection = packageSelection(actualProject, target, dependencies.artifacts, { allowLocalHost: true, localOrigin });
+  await assertProjectFilesUnchanged(projectDirectory, project, lockfileName);
+  const roots = project.roots.filter(root => root.importer === '.');
+  const executables = await checkExecutables(projectDirectory, project, roots, target, environment, dependencies);
+  return { selection, executables };
 }
 
 export async function validateInventory({ client, stateDirectory, config, signal, cwd = process.cwd() }, dependencies = {}) {
@@ -359,8 +515,6 @@ export async function validateInventory({ client, stateDirectory, config, signal
   const inventory = await loadInventory(stateDirectory);
   const projects = inventory.projects.filter(project => project.manager === client && project.targets.includes(target.id));
   if (projects.length === 0) fail('input', `inventory contains no ${client} projects for target ${target.id}`);
-  const groups = projects.flatMap(project => projectGroups(project, target, client).map(group => ({ project, group })));
-  if (groups.length === 0) fail('input', `inventory contains no reproducible ${client} registry roots for target ${target.id}`);
   const scratchRoot = resolve(cwd, '.work', 'tmp');
   await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
   const workspace = await mkdtemp(join(scratchRoot, 'mynpm-validate-'));
@@ -371,10 +525,12 @@ export async function validateInventory({ client, stateDirectory, config, signal
     await mkdir(mirrorDirectory, { recursive: true, mode: 0o700 });
     staticServer = await startStaticServer(mirrorDirectory);
     const origin = `http://127.0.0.1:${staticServer.port}`;
-    const artifacts = inventory.artifacts;
     const environment = await createClientEnvironment(workspace, `${origin}/current/`, join(workspace, 'tool-cache'));
     const version = await checkClientVersion(client, target, cwd, environment, dependencies);
-    let packageNumber = 0;
+    const artifacts = inventory.artifacts;
+    for (const project of projects) await assertSnapshotMatchesProject(project, target);
+    const expectedByProject = new Map(projects.map(project => [project, packageSelection(project, target, artifacts)]));
+    let projectNumber = 0;
     const validatedSelections = new Set();
     const executableResults = [];
     let finalGenerationId;
@@ -383,33 +539,28 @@ export async function validateInventory({ client, stateDirectory, config, signal
       const published = await publishSite({ stateDirectory, siteDirectory, config }, { renderBaseUrl: publicBaseUrl });
       finalGenerationId = published.generationId;
       const registry = `${publicBaseUrl}current/`;
-      const selectionsByProject = new Map(projects.map(project => [project, []]));
-      for (const { project, group } of groups) {
-        packageNumber += 1;
-        const result = await installImporter({
+      for (const project of projects) {
+        projectNumber += 1;
+        const result = await installProject({
           client,
           project,
-          group,
           target,
           workspace,
           registry,
           localOrigin: origin,
-          packageNumber,
+          projectNumber,
           dependencies: { ...dependencies, artifacts, signal },
         });
-        selectionsByProject.get(project).push(...result.selection);
+        compareSelections(expectedByProject.get(project), result.selection, project.id, client);
+        for (const item of expectedByProject.get(project)) {
+          validatedSelections.add(`${project.id}\0${item.identity}\0${item.integrity}`);
+        }
         executableResults.push(...Object.entries(result.executables).map(([name, output]) => ({ name, output })));
-      }
-      for (const project of projects) {
-        const actual = unionSelections(selectionsByProject.get(project));
-        const expected = packageSelection(project, target, artifacts, {});
-        compareSelections(expected, actual, project.id, client);
-        for (const item of expected) validatedSelections.add(`${project.id}\0${item.identity}\0${item.integrity}`);
       }
     }
     const invalidRequest = staticServer.requests.find(request => request.prefix === null);
     if (invalidRequest) fail('conflict', `validation served a request outside the local static site: ${invalidRequest.pathname}`);
-    if (staticServer.requests.length === 0) fail('operation', 'package manager made no requests to the local static site');
+    if (validatedSelections.size > 0 && staticServer.requests.length === 0) fail('operation', 'package manager made no requests to the local static site');
     return {
       client,
       version,
@@ -417,6 +568,7 @@ export async function validateInventory({ client, stateDirectory, config, signal
       target: target.id,
       packageCount: validatedSelections.size,
       projectCount: projects.length,
+      rootCount: projects.reduce((count, project) => count + project.roots.length, 0),
       requestCount: staticServer.requests.length,
       generationId: finalGenerationId,
       executables: executableResults,

@@ -74,11 +74,10 @@ function packageNameFromKey(key) {
 }
 
 function sanitizeResolved(value, label) {
-  if (value === null || !/^(?:https?|git\+https?):/i.test(value)) return { resolved: value, hadCredentials: false };
-  const prefix = value.startsWith('git+') ? 'git+' : '';
+  if (value === null || !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return { resolved: value, hadCredentials: false };
   let url;
   try {
-    url = new URL(prefix ? value.slice(prefix.length) : value);
+    url = new URL(value);
   } catch (cause) {
     throw new MynpmError('input', `${label} is not a valid URL`, { cause });
   }
@@ -89,7 +88,7 @@ function sanitizeResolved(value, label) {
     url.search = '';
     url.hash = '';
   }
-  return { resolved: `${prefix}${url.href}`, hadCredentials };
+  return { resolved: url.href, hadCredentials };
 }
 
 function classifySource(resolved, isLink, hadCredentials) {
@@ -166,7 +165,7 @@ function normalizeSpecifier(specifier, requestedName) {
   return splitAt > 0 ? target.slice(0, splitAt) : target;
 }
 
-export function parseNpmLock(lock, { projectId, packageManagerPin = null, lockfilePath, targetIds }) {
+export function parseNpmLock(lock, { projectId, packageManagerPin = null, lockfilePath, targetIds, snapshot = null }) {
   requireRecord(lock, 'npm lockfile');
   if (lock.lockfileVersion !== 2 && lock.lockfileVersion !== 3) {
     throw new MynpmError('input', `npm lockfileVersion must be 2 or 3; received ${String(lock.lockfileVersion)}`);
@@ -245,7 +244,9 @@ export function parseNpmLock(lock, { projectId, packageManagerPin = null, lockfi
     lockfilePath,
     lockfileVersion: lock.lockfileVersion,
     targets,
+    importers: ['.'],
     roots,
     packages,
+    snapshot,
   });
 }

@@ -133,6 +133,14 @@ function normalizeTargets(targetIds) {
   return targets.sort();
 }
 
+function normalizeImporterPath(value, label) {
+  const importerPath = requireText(value, label);
+  if (importerPath !== '.' && (importerPath.startsWith('/') || importerPath.includes('\\') || importerPath.split('/').some(part => part === '' || part === '.' || part === '..'))) {
+    invalid(`${label} must be a safe project-relative path`);
+  }
+  return importerPath;
+}
+
 function lockfileDocuments(values) {
   if (!Array.isArray(values) || values.length === 0) invalid('pnpm lockfile must contain at least one YAML document');
   const documents = values.map((value, index) => requireRecord(value, `pnpm lockfile document ${index + 1}`));
@@ -155,7 +163,7 @@ function canonicalValue(value) {
 
 function snapshotReference(key) {
   requireText(key, 'pnpm snapshot key');
-  return key.startsWith('/') ? key.slice(1) : key;
+  return (key.startsWith('/') ? key.slice(1) : key).split('(', 1)[0];
 }
 
 function packageReferenceMatches(reference, requestedName, packageRecord) {
@@ -166,7 +174,7 @@ function packageReferenceMatches(reference, requestedName, packageRecord) {
   if (candidate.includes('@')) {
     try {
       const referenced = packageIdentity(candidate, 'pnpm importer package reference');
-      return referenced.name === identity.name && referenced.reference === identity.reference;
+      return referenced.name === identity.name && referenced.reference.split('(', 1)[0] === identity.reference.split('(', 1)[0];
     } catch (error) {
       if (!(error instanceof MynpmError)) throw error;
     }
@@ -213,7 +221,7 @@ function importerRoots(document, packageEntries, importerLabel) {
   const importers = document.importers ?? {};
   requireRecord(importers, `${importerLabel}.importers`);
   for (const [importerPath, importerValue] of Object.entries(importers)) {
-    requireText(importerPath, `${importerLabel}.importers path`);
+    normalizeImporterPath(importerPath, `${importerLabel}.importers path`);
     const importer = requireRecord(importerValue, `${importerLabel}.importers[${JSON.stringify(importerPath)}]`);
     for (const group of dependencyGroups) {
       const dependencies = importer[group];
@@ -252,11 +260,12 @@ function importerRoots(document, packageEntries, importerLabel) {
   return roots;
 }
 
-function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockfilePath, targetIds }) {
+function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockfilePath, targetIds, snapshot = null }) {
   const documents = lockfileDocuments(values);
   const targets = normalizeTargets(targetIds);
   const packagesByKey = new Map();
   const snapshotKeys = new Set();
+  const importerPaths = new Set();
   const roots = [];
   for (const [index, document] of documents.entries()) {
     const documentPackages = document.packages ?? {};
@@ -271,6 +280,11 @@ function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockf
     }
     const snapshots = document.snapshots ?? {};
     requireRecord(snapshots, `pnpm lockfile document ${index + 1}.snapshots`);
+    const importers = document.importers ?? {};
+    requireRecord(importers, `pnpm lockfile document ${index + 1}.importers`);
+    for (const importerPath of Object.keys(importers)) {
+      importerPaths.add(normalizeImporterPath(importerPath, `pnpm lockfile document ${index + 1}.importers path`));
+    }
     for (const [key, snapshotValue] of Object.entries(snapshots)) {
       const snapshot = requireRecord(snapshotValue, `pnpm lockfile snapshots[${JSON.stringify(key)}]`);
       for (const group of ['dependencies', 'optionalDependencies']) {
@@ -297,8 +311,10 @@ function parsePnpmDocuments(values, { projectId, packageManagerPin = null, lockf
     lockfilePath: requireText(lockfilePath, 'lockfile path'),
     lockfileVersion: documents[0].lockfileVersion,
     targets,
+    importers: [...importerPaths].sort(),
     roots: [...uniqueRoots.values()].sort((left, right) => left.importer.localeCompare(right.importer) || left.group.localeCompare(right.group) || left.requestedName.localeCompare(right.requestedName)),
     packages: [...packagesByKey.values()].sort((left, right) => left.key.localeCompare(right.key)),
+    snapshot,
   };
 }
 
