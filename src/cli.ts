@@ -47,7 +47,7 @@ type ParsedArguments =
   | (CommonArguments & { command: 'fetch'; positionals: [] })
   | (CommonArguments & { command: 'verify'; positionals: [] })
   | (CommonArguments & { command: 'publish'; sitedir?: string; positionals: [] })
-  | (CommonArguments & { command: 'validate'; client: PackageManager; positionals: [] })
+  | (CommonArguments & { command: 'validate'; client: PackageManager; smokeExecutables: boolean; positionals: [] })
   | (CommonArguments & { command: 'doctor'; positionals: [string] });
 type RawArguments = {
   command?: Command;
@@ -58,6 +58,7 @@ type RawArguments = {
   project?: string;
   manager?: string;
   client?: string;
+  smokeExecutables: boolean;
   json: boolean;
   positionals: string[];
 };
@@ -92,7 +93,7 @@ function usage(message: string): never {
 }
 
 function parseArguments(argv: readonly string[]): ParsedArguments {
-  const options: RawArguments = { targets: [], json: false, positionals: [] };
+  const options: RawArguments = { targets: [], smokeExecutables: false, json: false, positionals: [] };
   const seen = new Set<string>();
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -104,6 +105,11 @@ function parseArguments(argv: readonly string[]): ParsedArguments {
     if (argument === '--json') {
       if (options.json) usage('--json may only be specified once');
       options.json = true;
+      continue;
+    }
+    if (argument === '--smoke-executables') {
+      if (options.smokeExecutables) usage('--smoke-executables may only be specified once');
+      options.smokeExecutables = true;
       continue;
     }
     if (valueOptions.has(argument)) {
@@ -136,6 +142,7 @@ function parseArguments(argv: readonly string[]): ParsedArguments {
   if (options.project !== undefined && command !== 'import-lock') usage('--project is only valid with import-lock');
   if (options.manager !== undefined && command !== 'add') usage('--manager is only valid with add');
   if (options.client !== undefined && command !== 'validate') usage('--client is only valid with validate');
+  if (options.smokeExecutables && command !== 'validate') usage('--smoke-executables is only valid with validate');
   if (options.sitedir !== undefined && command !== 'publish') usage('--site-dir is only valid with publish');
   if (options.targets.length > 0 && command !== 'import-lock' && command !== 'add') usage('--target is only valid with import-lock or add');
   switch (command) {
@@ -161,7 +168,7 @@ function parseArguments(argv: readonly string[]): ParsedArguments {
       if (options.positionals.length !== 0) usage(`${command} does not take positional arguments`);
       if (command === 'validate') {
         if (!isPackageManager(options.client)) usage('validate requires --client npm or pnpm');
-        return { command, config: options.config, statedir: options.statedir, client: options.client, positionals: [] };
+        return { command, config: options.config, statedir: options.statedir, client: options.client, smokeExecutables: options.smokeExecutables, positionals: [] };
       }
       if (command === 'publish') return { command, config: options.config, statedir: options.statedir, sitedir: options.sitedir, positionals: [] };
       return { command, config: options.config, statedir: options.statedir, positionals: [] };
@@ -524,9 +531,9 @@ function execute(argv: readonly string[]): Effect.Effect<void, MynpmError> {
       return;
     }
     if (parsed.command === 'validate') {
-      const result = yield* validateInventory({ client: parsed.client, stateDirectory, config, cwd });
+      const result = yield* validateInventory({ client: parsed.client, stateDirectory, config, cwd, smokeExecutables: parsed.smokeExecutables });
       yield* Effect.sync(() => {
-        process.stdout.write(`Restored ${result.client}@${result.version} on Node ${result.nodeVersion} for ${result.target}: ${result.packageCount} package selections across ${result.projectCount} projects and ${result.requestCount} local HTTP requests.\n`);
+        process.stdout.write(`Restored ${result.client}@${result.version} on Node ${result.nodeVersion} for ${result.target}: ${result.packageCount} package selections across ${result.projectCount} projects; skipped ${result.platformSkippedCount} platform-inapplicable optional instances; served ${result.requestCount} local HTTP requests.\n`);
         for (const executable of result.executables) process.stdout.write(`Executed ${executable.name}: ${executable.output}\n`);
       });
       return;

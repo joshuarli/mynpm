@@ -53,6 +53,20 @@ it.effect('archive inspection accepts the expected package and reports bounded c
   assert.ok(inspected.unpackedBytes > 0);
 }));
 
+it.effect('archive inspection normalizes a scoped package name directory', () => withScratch(directory => Effect.gen(function*() {
+  const archive = join(directory, 'types-chai.tgz');
+  writeFileSync(archive, createTar([
+    { name: 'chai/', type: '5' },
+    { name: 'chai/package.json', content: Buffer.from('{"name":"@types/chai","version":"5.2.3"}') },
+    { name: 'chai/index.d.ts', content: Buffer.from('export {}') },
+  ]));
+
+  const inspected = yield* inspectPackageArchive(archive, { name: '@types/chai', version: '5.2.3' });
+  assert.ok(inspected.entries.some(entry => entry.path === 'package/package.json'));
+  assert.ok(inspected.entries.some(entry => entry.path === 'package/index.d.ts'));
+  assert.ok(inspected.entries.every(entry => !entry.path.startsWith('chai/')));
+})));
+
 it.effect('archive inspection rejects a mismatched package identity', () => Effect.gen(function*() {
   const outcome = yield* Effect.result(inspectPackageArchive(validArchive, { name: 'other', version: '1.2.3' }));
   assert.equal(outcome._tag, 'Failure');

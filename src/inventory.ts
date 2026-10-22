@@ -36,6 +36,7 @@ export interface ProjectSnapshot {
   manifest: string | null;
   lockfile: string;
   workspaceFiles: ProjectSnapshotFile[];
+  npmInstallOptions: { legacyPeerDeps: boolean | null; installLinks: boolean | null };
 }
 
 export interface PackageRecord {
@@ -206,7 +207,12 @@ function normalizeSnapshotPath(value: unknown, label: string, category: ErrorCat
 function normalizeSnapshot(value: unknown, label: string, category: ErrorCategory, manager: PackageManager, lockfileVersion: string | 2 | 3): ProjectSnapshot | null {
   if (value === null) return null;
   const record = requireRecord(value, label, category);
-  exactKeys(record, ['manifest', 'lockfile', 'workspaceFiles'], label, category);
+  const snapshotFields = ['manifest', 'lockfile', 'workspaceFiles'];
+  const allowedFields = new Set([...snapshotFields, 'npmInstallOptions']);
+  const unknownField = Object.keys(record).find(key => !allowedFields.has(key));
+  const missingField = snapshotFields.find(key => !Object.hasOwn(record, key));
+  if (unknownField !== undefined) invalid(`${label} has unknown field ${unknownField}`, category);
+  if (missingField !== undefined) invalid(`${label} is missing field ${missingField}`, category);
   const manifestValue = record.manifest;
   const manifest = manifestValue === null ? null : requireContents(manifestValue, `${label}.manifest`, category);
   if (manifest !== null) {
@@ -259,7 +265,25 @@ function normalizeSnapshot(value: unknown, label: string, category: ErrorCategor
   if (new Set(workspaceFiles.map(file => file.path)).size !== workspaceFiles.length) {
     invalid(`${label}.workspaceFiles contains duplicate paths`, category);
   }
-  return { manifest, lockfile, workspaceFiles };
+  const optionsValue = record.npmInstallOptions;
+  let npmInstallOptions: ProjectSnapshot['npmInstallOptions'] = { legacyPeerDeps: null, installLinks: null };
+  if (optionsValue !== undefined) {
+    const options = requireRecord(optionsValue, `${label}.npmInstallOptions`, category);
+    exactKeys(options, ['legacyPeerDeps', 'installLinks'], `${label}.npmInstallOptions`, category);
+    const legacyPeerDeps = options.legacyPeerDeps;
+    const installLinks = options.installLinks;
+    if (legacyPeerDeps !== null && typeof legacyPeerDeps !== 'boolean') {
+      invalid(`${label}.npmInstallOptions.legacyPeerDeps must be a boolean or null`, category);
+    }
+    if (installLinks !== null && typeof installLinks !== 'boolean') {
+      invalid(`${label}.npmInstallOptions.installLinks must be a boolean or null`, category);
+    }
+    npmInstallOptions = { legacyPeerDeps, installLinks };
+  }
+  if (manager === 'pnpm' && (npmInstallOptions.legacyPeerDeps !== null || npmInstallOptions.installLinks !== null)) {
+    invalid(`${label}.npmInstallOptions must be empty for pnpm`, category);
+  }
+  return { manifest, lockfile, workspaceFiles, npmInstallOptions };
 }
 
 function validateIntegrity(value: unknown, label: string, category: ErrorCategory): string | null {

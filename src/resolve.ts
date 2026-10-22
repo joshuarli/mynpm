@@ -9,6 +9,7 @@ import { updateInventory } from './inventory-store.ts';
 import { parseNpmLock } from './lock-npm.ts';
 import { parsePnpmLock } from './lock-pnpm.ts';
 import { runProcess } from './process.ts';
+import { assertRestorableProjectSnapshot } from './project-snapshot.ts';
 
 type RootPin = { name: string; version: string };
 type ResolverRuntime = { path: string; locale: string; temporaryDirectory: string };
@@ -120,9 +121,13 @@ function resolveTarget({ manager, roots, target, config, workspace, runtime }: R
       dependencies: Object.fromEntries(roots.map(root => [root.name, root.version])),
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+    const resolutionManifest = manager === 'npm'
+      ? manifest
+      : { name: manifest.name, version: manifest.version, private: manifest.private, dependencies: manifest.dependencies };
+    const resolutionManifestText = `${JSON.stringify(resolutionManifest, null, 2)}\n`;
     const manifestPath = join(projectDirectory, 'package.json');
     yield* Effect.tryPromise({
-      try: signal => writeFile(manifestPath, manifestText, { flag: 'wx', signal }),
+      try: signal => writeFile(manifestPath, resolutionManifestText, { flag: 'wx', signal }),
       catch: cause => operationFailure(cause, `could not write package manifest: ${manifestPath}`),
     });
     const environment = toolEnvironment(workspace, target, config.upstreamRegistry, runtime);
@@ -160,7 +165,12 @@ function resolveTarget({ manager, roots, target, config, workspace, runtime }: R
       packageManagerPin,
       lockfilePath: `add/${manager}/${target.id}/${lockfileName}`,
       targetIds: [target.id],
-      snapshot: { manifest: manifestText, lockfile: lockText, workspaceFiles: [] },
+      snapshot: {
+        manifest: manifestText,
+        lockfile: lockText,
+        workspaceFiles: [],
+        npmInstallOptions: { legacyPeerDeps: null, installLinks: null },
+      },
     };
     const project = manager === 'npm'
       ? yield* Effect.try({
@@ -168,6 +178,10 @@ function resolveTarget({ manager, roots, target, config, workspace, runtime }: R
         catch: cause => inputFailure(cause, `could not parse ${manager} lockfile`),
       })
       : yield* parsePnpmLock(lockText, parseOptions);
+    yield* Effect.try({
+      try: () => assertRestorableProjectSnapshot(manager, parseOptions.snapshot),
+      catch: cause => inputFailure(cause, `generated ${manager} project is not restorable`),
+    });
     return yield* Effect.try({
       try: () => validateResolvedProject(project, roots, target, manager),
       catch: cause => inputFailure(cause, 'resolved project did not match requested package pins'),

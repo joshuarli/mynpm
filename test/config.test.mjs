@@ -7,8 +7,8 @@ const baseConfig = {
   publicBaseUrl: 'https://deps.example.net/mirror/',
   upstreamRegistry: 'https://registry.npmjs.org/',
   targets: [
-    { id: 'mac-arm64', os: 'darwin', cpu: 'arm64', node: '24.22.0' },
-    { id: 'linux-x64-gnu', os: 'linux', cpu: 'x64', libc: 'glibc', node: '24.22.0' },
+    { id: 'mac-arm64', os: 'darwin', cpu: 'arm64', node: '26.12.0' },
+    { id: 'linux-x64-gnu', os: 'linux', cpu: 'x64', libc: 'glibc', node: '26.12.0' },
   ],
   policy: {
     externalSources: 'reject',
@@ -53,7 +53,7 @@ test('config rejects private registries and unsafe publication URLs', () => {
 
 test('config rejects unsupported, duplicate, and malformed targets', () => {
   assert.throws(
-    () => parse({ targets: [{ id: 'windows-x64', os: 'win32', cpu: 'x64', node: '24.22.0' }] }),
+    () => parse({ targets: [{ id: 'windows-x64', os: 'win32', cpu: 'x64', node: '26.12.0' }] }),
     error => error.category === 'input',
   );
   assert.throws(

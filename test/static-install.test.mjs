@@ -30,5 +30,5 @@ test('npm installs the seed from a local static site with fresh caches', () => {
   assert.match(output, /PASS fresh cache \+ lockfile \(npm ci\)/);
   assert.match(output, /GET .*\/mirror\/current\/flatdemo/);
   assert.match(output, /GET .*\/mirror\/current\/@flatrepo%2fdemo/);
-  assert.match(output, /GET .*\/mirror\/tarballs\/[a-f0-9]{128}\.tgz/);
+  assert.match(output, /GET .*\/mirror\/current\/-\/tarballs\/[a-f0-9]{128}\.tgz/);
 });

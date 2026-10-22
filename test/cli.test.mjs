@@ -12,6 +12,7 @@ const configPath = join(repositoryRoot, 'test', 'fixtures', 'mynpm.json');
 const lockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'package-lock-v3.json');
 const addLockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'package-lock-add.json');
 const pnpmLockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'pnpm-v12-two-documents.yaml');
+const pnpmPeerLockfilePath = join(repositoryRoot, 'test', 'fixtures', 'locks', 'pnpm-v12-peer.yaml');
 
 let yamlAvailable = true;
 try {
@@ -48,6 +49,12 @@ function runCli(scratch, args, overrides = {}) {
   });
 }
 
+function importableNpmLockText() {
+  const lock = JSON.parse(readFileSync(lockfilePath, 'utf8'));
+  delete lock.packages['node_modules/credential-url'];
+  return `${JSON.stringify(lock)}\n`;
+}
+
 test('plan emits inventory JSON without creating state', () => withScratch(scratch => {
   const stateDirectory = join(scratch, 'state');
   const result = runCli(scratch, [
@@ -72,11 +79,13 @@ test('plan emits inventory JSON without creating state', () => withScratch(scrat
 
 test('import-lock writes a versioned inventory and plan observes it', () => withScratch(scratch => {
   const stateDirectory = join(scratch, 'state');
+  const importLockPath = join(scratch, 'package-lock.json');
+  writeFileSync(importLockPath, importableNpmLockText());
   const imported = runCli(scratch, [
     '--config', configPath,
     '--state-dir', stateDirectory,
     'import-lock',
-    lockfilePath,
+    importLockPath,
     '--project', 'web',
     '--target', 'linux-x64-gnu',
   ]);
@@ -99,7 +108,7 @@ test('import-lock honors and records the project package manager pin', () => wit
   const projectDirectory = join(scratch, 'project');
   mkdirSync(join(projectDirectory, 'packages', 'workspace'), { recursive: true });
   const projectLockPath = join(projectDirectory, 'package-lock.json');
-  writeFileSync(projectLockPath, readFileSync(lockfilePath));
+  writeFileSync(projectLockPath, importableNpmLockText());
   const manifest = '{"name":"web","packageManager":"npm@12.2.1"}\n';
   const workspaceManifest = '{"name":"workspace-link","version":"1.0.0"}\n';
   writeFileSync(join(projectDirectory, 'package.json'), manifest);
@@ -120,6 +129,7 @@ test('import-lock honors and records the project package manager pin', () => wit
   const inventory = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8'));
   assert.equal(inventory.projects[0].packageManagerPin, 'npm@12.2.1');
   assert.equal(inventory.projects[0].snapshot.manifest, manifest);
+  assert.deepEqual(inventory.projects[0].snapshot.npmInstallOptions, { legacyPeerDeps: null, installLinks: null });
   assert.deepEqual(inventory.projects[0].snapshot.workspaceFiles, [{ path: 'packages/workspace/package.json', contents: workspaceManifest }]);
   assert.doesNotMatch(inventory.projects[0].snapshot.lockfile, /user:secret|token=secret/);
 
@@ -136,13 +146,37 @@ test('import-lock honors and records the project package manager pin', () => wit
   assert.match(mismatch.stderr, /does not match npm lockfile/);
 }));
 
+test('import-lock rejects lockfile credentials before writing inventory state', () => withScratch(scratch => {
+  const projectDirectory = join(scratch, 'project');
+  mkdirSync(projectDirectory);
+  const projectLockPath = join(projectDirectory, 'package-lock.json');
+  const lockBytes = readFileSync(lockfilePath);
+  writeFileSync(projectLockPath, lockBytes);
+  writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web"}\n');
+  const stateDirectory = join(scratch, 'state');
+
+  const result = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', stateDirectory,
+    'import-lock',
+    projectLockPath,
+    '--project', 'web',
+  ]);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /credential-bearing URL/);
+  assert.doesNotMatch(result.stderr, /user:secret|token=secret/);
+  assert.throws(() => readdirSync(stateDirectory), { code: 'ENOENT' });
+  assert.deepEqual(readFileSync(projectLockPath), lockBytes);
+}));
+
 test('import-lock rejects symlinked workspace snapshot paths', () => withScratch(scratch => {
   const projectDirectory = join(scratch, 'project');
   const outsideDirectory = join(scratch, 'outside');
   mkdirSync(projectDirectory);
   mkdirSync(outsideDirectory);
   writeFileSync(join(projectDirectory, 'package.json'), '{"name":"web"}\n');
-  writeFileSync(join(projectDirectory, 'package-lock.json'), readFileSync(lockfilePath));
+  writeFileSync(join(projectDirectory, 'package-lock.json'), importableNpmLockText());
   writeFileSync(join(outsideDirectory, 'package.json'), '{"name":"outside"}\n');
   mkdirSync(join(projectDirectory, 'packages'));
   symlinkSync(outsideDirectory, join(projectDirectory, 'packages', 'workspace'));
@@ -252,6 +286,47 @@ test('add strips caller auth and registry settings, resolves exact roots, and re
   const repeated = runCli(scratch, arguments_, environment);
   assert.equal(repeated.status, 0, repeated.stderr);
   assert.deepEqual(readFileSync(inventoryPath), inventoryBytes);
+}));
+
+test('add with pnpm preserves peer-qualified snapshots and plain artifact keys', () => withScratch(scratch => {
+  const fakeBin = join(scratch, 'bin');
+  mkdirSync(fakeBin);
+  const fakePnpm = join(fakeBin, 'pnpm');
+  writeFileSync(fakePnpm, [
+    '#!/bin/sh',
+    'if [ "$1" = "--version" ]; then printf "12.15.0\\n"; exit 0; fi',
+    'test "$1" = "install"',
+    'test "$2" = "--lockfile-only"',
+    'test "$3" = "--ignore-scripts"',
+    'test "$4" = "@effect/vitest@4.0.5"',
+    'test "${NPM_TOKEN+x}" != x',
+    'test "${NODE_AUTH_TOKEN+x}" != x',
+    'test "$npm_config_registry" = "https://registry.npmjs.org/"',
+    `cp '${pnpmPeerLockfilePath}' pnpm-lock.yaml`,
+    '',
+  ].join('\n'));
+  chmodSync(fakePnpm, 0o755);
+  const stateDirectory = join(scratch, 'state');
+  const result = runCli(scratch, [
+    '--config', configPath,
+    '--state-dir', stateDirectory,
+    '--target', 'linux-x64-gnu',
+    'add',
+    '@effect/vitest@4.0.5',
+    '--manager',
+    'pnpm',
+  ], {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    NPM_TOKEN: 'inherited-secret',
+    NODE_AUTH_TOKEN: 'inherited-secret',
+    npm_config_registry: 'https://registry.example.invalid/',
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const project = JSON.parse(readFileSync(join(stateDirectory, 'inventory.json'), 'utf8')).projects[0];
+  assert.equal(project.roots[0].packageKey, '@effect/vitest@4.0.5');
+  assert.ok(project.packages.some(pkg => pkg.key === '@effect/vitest@4.0.5'));
+  assert.ok(project.snapshot.lockfile.includes('@effect/vitest@4.0.5(effect@4.0.5)(vitest@'));
 }));
 
 test('doctor reports external sources without changing the project', () => withScratch(scratch => {

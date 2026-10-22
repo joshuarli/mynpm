@@ -6,6 +6,7 @@ import { parsePnpmLock, parsePnpmDocuments, pnpmBuildPackageKeys } from '../src/
 
 const fixture = new URL('./fixtures/locks/pnpm-v9-local.yaml', import.meta.url);
 const twoDocumentFixture = new URL('./fixtures/locks/pnpm-v12-two-documents.yaml', import.meta.url);
+const peerFixture = new URL('./fixtures/locks/pnpm-v12-peer.yaml', import.meta.url);
 const integrity = `sha512-${Buffer.alloc(64, 7).toString('base64')}`;
 let yamlAvailable = true;
 
@@ -50,6 +51,21 @@ it.effect.skipIf(!yamlAvailable)('pnpm two-document YAML preserves manager and p
     ['dependencies', 'private-download', '1.0.0'],
   ]);
   assert.deepEqual(yield* pnpmBuildPackageKeys(text), ['private-download@1.0.0']);
+}));
+
+it.effect.skipIf(!yamlAvailable)('pnpm-generated peer fixture keeps peer context on snapshots and plain artifact keys', () => Effect.gen(function*() {
+  const text = yield* Effect.tryPromise(() => readFile(peerFixture, 'utf8'));
+  const project = yield* parsePnpmLock(text, {
+    projectId: 'peer-fixture',
+    lockfilePath: 'pnpm-lock.yaml',
+    targetIds: ['linux-x64-gnu'],
+  });
+
+  assert.equal(project.roots[0].requestedName, '@effect/vitest');
+  assert.equal(project.roots[0].packageKey, '@effect/vitest@4.0.5');
+  assert.ok(project.packages.some(pkg => pkg.key === '@effect/vitest@4.0.5'));
+  assert.ok(!project.packages.some(pkg => pkg.key.includes('(effect@')));
+  assert.match(text, /'@effect\/vitest@4\.0\.5\(effect@4\.0\.5\)\(vitest@/);
 }));
 
 test('pnpm documents union packages, roots, aliases, and peer-context snapshots', () => {
@@ -141,6 +157,108 @@ test('pnpm importer paths stay with their roots', () => {
 
   assert.equal(project.roots[0].importer, 'packages/web');
   assert.deepEqual(project.importers, ['packages/empty', 'packages/web']);
+});
+
+test('pnpm roots resolve peer-qualified aliases to plain artifact keys and preserve peer snapshots', () => {
+  const packageKeys = {
+    '@scope/app@2.0.0': { name: '@scope/app', resolution: { integrity } },
+    '@scope/peer@1.0.0': { name: '@scope/peer', resolution: { integrity } },
+    '@scope/nested@3.0.0': { name: '@scope/nested', resolution: { integrity } },
+  };
+  const project = parsePnpmDocuments([{
+    lockfileVersion: '9.0',
+    importers: {
+      '.': {
+        dependencies: {
+          'app-alias': {
+            specifier: 'npm:@scope/app@^2.0.0',
+            version: '@scope/app@2.0.0(@scope/peer@1.0.0(@scope/nested@3.0.0))',
+          },
+        },
+      },
+    },
+    packages: packageKeys,
+    snapshots: {
+      '@scope/app@2.0.0(@scope/peer@1.0.0(@scope/nested@3.0.0))': {
+        dependencies: { '@scope/peer': '1.0.0(@scope/nested@3.0.0)' },
+      },
+      '@scope/app@2.0.0(@scope/peer@1.0.0(@scope/other@4.0.0))': {
+        dependencies: { '@scope/peer': '1.0.0(@scope/other@4.0.0)' },
+      },
+      '@scope/peer@1.0.0(@scope/nested@3.0.0)': {
+        dependencies: { '@scope/nested': '3.0.0' },
+      },
+      '@scope/peer@1.0.0(@scope/other@4.0.0)': {
+        dependencies: { '@scope/nested': '3.0.0' },
+      },
+      '@scope/nested@3.0.0': {},
+    },
+  }], {
+    projectId: 'peer-roots',
+    lockfilePath: 'pnpm-lock.yaml',
+    targetIds: ['linux-x64-gnu'],
+  });
+
+  assert.deepEqual(project.roots[0], {
+    importer: '.',
+    requestedName: 'app-alias',
+    specifier: 'npm:@scope/app@^2.0.0',
+    packageName: '@scope/app',
+    packageVersion: '2.0.0',
+    group: 'dependencies',
+    packageKey: '@scope/app@2.0.0',
+  });
+  assert.deepEqual(project.packages.map(pkg => pkg.key), [
+    '@scope/app@2.0.0',
+    '@scope/nested@3.0.0',
+    '@scope/peer@1.0.0',
+  ]);
+});
+
+test('pnpm peer-qualified root resolves its plain artifact package key', () => {
+  const project = parsePnpmDocuments([{
+    lockfileVersion: '9.0',
+    importers: {
+      '.': { dependencies: { button: { specifier: '1.0.0', version: '1.0.0(react@19.0.0)' } } },
+    },
+    packages: {
+      'button@1.0.0': { resolution: { integrity } },
+      'react@19.0.0': { resolution: { integrity } },
+    },
+    snapshots: {
+      'button@1.0.0(react@19.0.0)': { dependencies: { react: '19.0.0' } },
+      'react@19.0.0': {},
+    },
+  }], {
+    projectId: 'button-peer-root',
+    lockfilePath: 'pnpm-lock.yaml',
+    targetIds: ['linux-x64-gnu'],
+  });
+
+  assert.equal(project.roots[0].packageName, 'button');
+  assert.equal(project.roots[0].packageVersion, '1.0.0');
+  assert.equal(project.roots[0].packageKey, 'button@1.0.0');
+  assert.deepEqual(project.packages.map(pkg => pkg.key), ['button@1.0.0', 'react@19.0.0']);
+});
+
+test('pnpm rejects peer-qualified snapshot dependencies with nonexistent refs', () => {
+  const lock = {
+    lockfileVersion: '9.0',
+    packages: {
+      'app@1.0.0': { resolution: { integrity } },
+      'peer@1.0.0': { resolution: { integrity } },
+    },
+    snapshots: {
+      'app@1.0.0(peer@1.0.0)': { dependencies: { peer: '1.0.0(peer@2.0.0)' } },
+      'peer@1.0.0': {},
+    },
+  };
+
+  assert.throws(() => parsePnpmDocuments([lock], {
+    projectId: 'missing-peer',
+    lockfilePath: 'pnpm-lock.yaml',
+    targetIds: ['linux-x64-gnu'],
+  }), /snapshot dependency has no matching snapshot: peer@1\.0\.0\(peer@2\.0\.0\)/);
 });
 
 test('pnpm rejects unsupported revisions, unmatched snapshots, and conflicting documents', () => {

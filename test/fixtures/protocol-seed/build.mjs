@@ -1,9 +1,7 @@
 #!/usr/bin/env node
-// Fully offline PoC generator. Requires only Node.js and npm. No runtime npm deps.
-// Usage: node build.mjs /absolute/output/site http://127.0.0.1:PORT/mirror/
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -31,7 +29,12 @@ try {
       encoding: 'utf8', env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
     });
     if (pack.status !== 0) throw new Error(`npm pack failed: ${pack.stderr || pack.stdout}`);
-    const [result] = JSON.parse(pack.stdout);
+    const packed = JSON.parse(pack.stdout);
+    const results = Array.isArray(packed) ? packed : typeof packed === 'object' && packed !== null ? Object.values(packed) : [];
+    const result = results.length === 1 ? results[0] : undefined;
+    if (typeof result !== 'object' || result === null || typeof result.filename !== 'string') {
+      throw new Error('npm pack returned no package filename');
+    }
     const tarBytes = readFileSync(join(scratch, result.filename));
     const sha512 = createHash('sha512').update(tarBytes).digest();
     const digestHex = sha512.toString('hex');
@@ -44,6 +47,9 @@ try {
     } else {
       writeFileSync(blobPath, tarBytes, { flag: 'wx' });
     }
+    const generationTarball = join(generation, '-', 'tarballs', blobName);
+    mkdirSync(dirname(generationTarball), { recursive: true });
+    linkSync(blobPath, generationTarball);
     const version = {
       name: pkg.name,
       version: pkg.version,
@@ -53,7 +59,7 @@ try {
       peerDependenciesMeta: pkg.peerDependenciesMeta ?? {},
       engines: pkg.engines ?? {},
       dist: {
-        tarball: new URL('tarballs/' + blobName, base).href,
+        tarball: new URL('current/-/tarballs/' + blobName, base).href,
         integrity,
         shasum,
       },

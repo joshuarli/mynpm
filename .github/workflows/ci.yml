@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 jobs:
-  offline:
+  local-suite:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -24,16 +24,18 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: 22.16.0
+          node-version: 26.12.0
           package-manager-cache: false
+      - name: Install latest npm
+        run: npm install --global npm@latest --ignore-scripts --no-audit --no-fund
       - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
         with:
           version: 12.15.0
           install: false
       - name: Check pinned compatibility toolchain
         run: |
-          test "$(node --version)" = "v22.16.0"
-          test "$(npm --version)" = "10.9.2"
+          test "$(node --version)" = "v26.12.0"
+          test "$(npm --version)" = "$(npm view npm@latest version)"
       - name: Prepare ignored scratch
         run: |
           if ! grep -qxF '.work/' .git/info/exclude; then
@@ -71,20 +73,20 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: 24.22.0
+          node-version: 26.12.0
           package-manager-cache: false
-      - name: Install pinned npm
-        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
+      - name: Install latest npm
+        run: npm install --global npm@latest --ignore-scripts --no-audit --no-fund
       - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
         with:
           version: 12.15.0
           install: false
-      - name: Check pinned client and architecture
+      - name: Check client and architecture
         env:
           CLIENT: ${{ matrix.client }}
         run: |
-          test "$(node --version)" = "v24.22.0"
-          test "$(npm --version)" = "12.2.1"
+          test "$(node --version)" = "v26.12.0"
+          test "$(npm --version)" = "$(npm view npm@latest version)"
           if [ "$CLIENT" = pnpm ]; then test "$(pnpm --version)" = "12.15.0"; fi
           if [ "$RUNNER_OS" = macOS ]; then test "$(uname -m)" = arm64; fi
       - name: Prepare ignored scratch
@@ -101,7 +103,69 @@ jobs:
         env:
           TMPDIR: ${{ github.workspace }}/.work/tmp
           npm_config_cache: ${{ github.workspace }}/.work/tmp/npm-cache
+          MYNPM_REQUIRE_STATIC_CLIENTS: '1'
         run: pnpm exec vitest run test/publish.test.mjs test/validate.test.mjs
+
+  egress-enforced:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 26.12.0
+          package-manager-cache: false
+      - name: Prepare ignored scratch
+        run: |
+          if ! grep -qxF '.work/' .git/info/exclude; then
+            printf '\n.work/\n' >> .git/info/exclude
+          fi
+          mkdir -p .work/tmp
+      - name: Install latest npm and pinned pnpm
+        run: npm install --prefix .work/toolchain npm@latest pnpm@12.15.0 --ignore-scripts --no-audit --no-fund
+      - name: Create executable package-manager shims
+        run: |
+          mkdir -p .work/toolchain/bin
+          cat > .work/toolchain/bin/npm <<'EOF'
+          #!/bin/sh
+          exec node "$(dirname "$0")/../node_modules/npm/bin/npm-cli.js" "$@"
+          EOF
+          cat > .work/toolchain/bin/pnpm <<'EOF'
+          #!/bin/sh
+          exec node "$(dirname "$0")/../node_modules/pnpm/bin/pnpm.mjs" "$@"
+          EOF
+          chmod +x .work/toolchain/bin/npm .work/toolchain/bin/pnpm
+      - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
+        with:
+          version: 12.15.0
+          install: false
+      - name: Install project dependencies
+        env:
+          TMPDIR: ${{ github.workspace }}/.work/tmp
+        run: |
+          latest_npm_version="$(node -p "require('./.work/toolchain/node_modules/npm/package.json').version")"
+          echo "LATEST_NPM_VERSION=$latest_npm_version" >> "$GITHUB_ENV"
+          pnpm install --frozen-lockfile --ignore-scripts --store-dir .work/pnpm-store
+      - name: Run static clients with external networking disabled
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          docker pull node:26.12.0-bookworm
+          docker run --network none --rm \
+            -e TMPDIR=/repo/.work/tmp \
+            -e MYNPM_REQUIRE_STATIC_CLIENTS=1 \
+            -e LATEST_NPM_VERSION="$LATEST_NPM_VERSION" \
+            -e PATH=/repo/.work/toolchain/bin:/repo/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -v "$GITHUB_WORKSPACE:/repo" -w /repo node:26.12.0-bookworm bash -c '
+              test "$(node --version)" = "v26.12.0"
+              test "$(npm --version)" = "$LATEST_NPM_VERSION"
+              test "$(pnpm --version)" = "12.15.0"
+              node -e "console.log(JSON.stringify({node: process.version, platform: process.platform, arch: process.arch}))"
+              node -e "const net=require(\"node:net\"); const socket=net.createConnection({host:\"1.1.1.1\",port:53}); const timer=setTimeout(()=>{socket.destroy();process.exit(1)},1500); socket.once(\"connect\",()=>{clearTimeout(timer);socket.destroy();process.exit(1)});socket.once(\"error\",()=>{clearTimeout(timer);process.exit(0)})"
+              node node_modules/vitest/vitest.mjs run test/publish.test.mjs test/validate.test.mjs
+            '
 
   public-smoke:
     if: github.event_name == 'workflow_dispatch' && inputs.public_smoke == true
@@ -113,18 +177,18 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: 24.22.0
+          node-version: 26.12.0
           package-manager-cache: false
-      - name: Install pinned npm
-        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
+      - name: Install latest npm
+        run: npm install --global npm@latest --ignore-scripts --no-audit --no-fund
       - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4
         with:
           version: 12.15.0
           install: false
-      - name: Check pinned toolchain
+      - name: Check toolchain
         run: |
-          test "$(node --version)" = "v24.22.0"
-          test "$(npm --version)" = "12.2.1"
+          test "$(node --version)" = "v26.12.0"
+          test "$(npm --version)" = "$(npm view npm@latest version)"
           test "$(pnpm --version)" = "12.15.0"
       - name: Prepare ignored scratch
         run: |

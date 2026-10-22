@@ -7,7 +7,7 @@ bash test.sh            # standard-library Python static HTTP server; npm instal
 bash test-nginx.sh      # optional; nginx static server and encoded scoped URL test
 ```
 
-Successful results on 2026-10-21: Node.js 22.16.0, npm 10.9.2, Python 3.13.5, nginx 1.26.3 (when testing nginx). The following were tested: `/mirror/current/@flatrepo%2fdemo`, `/mirror/current/flatdemo`, `/mirror/tarballs/<sha512>.tgz`, a transitive dependency, `npm install` with an empty cache, and `npm ci` using a *second* empty cache. The nginx test checked `Content-Type: application/json` even though metadata filenames have no suffix.
+`test.sh` and `test-nginx.sh` cover `/mirror/current/@flatrepo%2fdemo`, `/mirror/current/flatdemo`, and `/mirror/current/-/tarballs/<sha512>.tgz`. They install a transitive dependency with `npm install` and run `npm ci` with a second empty cache. The nginx test checks `Content-Type: application/json` for metadata paths without a file suffix.
 
 The generator uses a non-root `/mirror/` path intentionally and generates **absolute** `dist.tarball` URLs. It is not a full registry mirror or dependency resolver.
 
@@ -21,6 +21,9 @@ site/
       demo-v1/
         flatdemo                  (JSON packument)
         @flatrepo/demo           (JSON packument)
+        -/
+          tarballs/
+            <sha512-hex>.tgz      (hard link to shared tarball)
         manifest.json
     tarballs/
       <sha512-hex>.tgz            (immutable content-addressed data)

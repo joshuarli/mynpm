@@ -28,7 +28,7 @@ npm install '@flatrepo/demo@2.3.4' \
   --registry "${BASE}current/" --cache "$TEMP/cache1" \
   --ignore-scripts --no-audit --no-fund --fetch-retries=0
 node -e 'const assert = require("node:assert/strict"); assert.equal(require("@flatrepo/demo"), "static registry works (via @flatrepo/demo)"); console.log("PASS scoped + transitive dependency (npm install)")'
-grep -q "127.0.0.1:${PORT}/mirror/tarballs/" package-lock.json
+grep -q "127.0.0.1:${PORT}/mirror/current/-/tarballs/" package-lock.json
 ! grep -q 'registry.npmjs.org' package-lock.json
 rm -rf node_modules
 npm ci --registry "${BASE}current/" --cache "$TEMP/cache2" \

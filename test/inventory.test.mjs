@@ -50,6 +50,7 @@ test('inventory retains immutable project snapshots and rejects unsafe snapshot 
     manifest: '{"name":"web"}\n',
     lockfile: `${JSON.stringify(lock)}\n`,
     workspaceFiles: [{ path: 'packages/web/package.json', contents: '{"name":"web"}\n' }],
+    npmInstallOptions: { legacyPeerDeps: true, installLinks: false },
   };
   const inventory = mergeProject(createEmptyInventory(), { ...imported, snapshot });
   assert.deepEqual(inventory.projects[0].snapshot, snapshot);
@@ -65,6 +66,31 @@ test('inventory retains immutable project snapshots and rejects unsafe snapshot 
   const unexpectedFile = structuredClone(inventory);
   unexpectedFile.projects[0].snapshot.workspaceFiles.push({ path: '.npmrc', contents: 'registry=https://example.invalid/' });
   assert.throws(() => parseInventory(JSON.stringify(unexpectedFile)), error => error.category === 'corrupt');
+});
+
+test('inventory defaults old project snapshots and validates saved npm install options', () => {
+  const imported = structuredClone(mergeProject(createEmptyInventory(), {
+    ...project(),
+    snapshot: {
+      manifest: '{"name":"web"}\n',
+      lockfile: `${JSON.stringify(lock)}\n`,
+      workspaceFiles: [],
+      npmInstallOptions: { legacyPeerDeps: null, installLinks: null },
+    },
+  }));
+  delete imported.projects[0].snapshot.npmInstallOptions;
+  const oldShape = parseInventory(JSON.stringify(imported));
+  assert.deepEqual(oldShape.projects[0].snapshot.npmInstallOptions, { legacyPeerDeps: null, installLinks: null });
+
+  const malformed = structuredClone(oldShape);
+  malformed.projects[0].snapshot.npmInstallOptions.installLinks = 'false';
+  assert.throws(() => parseInventory(JSON.stringify(malformed)), error => error.category === 'corrupt');
+
+  const pnpmOptions = structuredClone(oldShape);
+  pnpmOptions.projects[0].manager = 'pnpm';
+  pnpmOptions.projects[0].lockfileVersion = '9.0';
+  pnpmOptions.projects[0].snapshot.npmInstallOptions.legacyPeerDeps = true;
+  assert.throws(() => parseInventory(JSON.stringify(pnpmOptions)), error => error.category === 'corrupt');
 });
 
 test('inventory records matching verified metadata and rejects divergent artifact identities', () => {

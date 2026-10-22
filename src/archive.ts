@@ -36,6 +36,7 @@ interface RawArchiveEntry {
 interface ArchiveInspection {
   entries: ArchiveEntry[];
   unpackedBytes: number;
+  rootDirectory: string;
 }
 
 function invalid(message: string, options?: ErrorOptions): never {
@@ -66,21 +67,32 @@ function parseListingLine(line: string): RawArchiveEntry {
   return { type, size, path };
 }
 
-function validateEntry(entry: RawArchiveEntry, seen: Set<string>): ArchiveEntry {
+function validateEntry(
+  entry: RawArchiveEntry,
+  seen: Set<string>,
+  expectedDirectory: string,
+  previousDirectory: string | null,
+): { entry: ArchiveEntry; rootDirectory: string } {
   const path = entry.path.endsWith('/') ? entry.path.slice(0, -1) : entry.path;
-  if (path !== 'package' && !path.startsWith('package/')) {
+  const separator = path.indexOf('/');
+  const rootDirectory = separator < 0 ? path : path.slice(0, separator);
+  if (rootDirectory !== 'package' && rootDirectory !== expectedDirectory) {
     invalid(`package archive entry is outside package/: ${path}`);
   }
-  if (path.startsWith('/') || path.split('/').some(part => part === '' || part === '.' || part === '..')) {
-    invalid(`package archive entry has an unsafe path: ${path}`);
+  if (previousDirectory !== null && rootDirectory !== previousDirectory) {
+    invalid(`package archive contains multiple roots: ${rootDirectory}`);
+  }
+  const normalizedPath = path === rootDirectory ? 'package' : `package/${path.slice(rootDirectory.length + 1)}`;
+  if (normalizedPath.startsWith('/') || normalizedPath.split('/').some(part => part === '' || part === '.' || part === '..')) {
+    invalid(`package archive entry has an unsafe path: ${normalizedPath}`);
   }
   if (entry.type !== '-' && entry.type !== 'd') {
-    invalid(`package archive contains an unsupported entry type at ${path}`);
+    invalid(`package archive contains an unsupported entry type at ${normalizedPath}`);
   }
-  if (seen.has(path)) invalid(`package archive contains duplicate entry ${path}`);
-  if (path === 'package' && entry.type !== 'd') invalid('package archive root must be a directory');
-  seen.add(path);
-  return { type: entry.type, size: entry.size, path };
+  if (seen.has(normalizedPath)) invalid(`package archive contains duplicate entry ${normalizedPath}`);
+  if (normalizedPath === 'package' && entry.type !== 'd') invalid('package archive root must be a directory');
+  seen.add(normalizedPath);
+  return { entry: { type: entry.type, size: entry.size, path: normalizedPath }, rootDirectory };
 }
 
 function archiveProcessError(cause: MynpmError, message: string): MynpmError {
@@ -107,13 +119,14 @@ function parseManifest(text: string, expectedIdentity: PackageIdentity): Record<
   return parsedManifest;
 }
 
-function inspectEntries(archivePath: string): Effect.Effect<ArchiveInspection, MynpmError> {
+function inspectEntries(archivePath: string, expectedDirectory: string): Effect.Effect<ArchiveInspection, MynpmError> {
   return Effect.gen(function*() {
     const entries: ArchiveEntry[] = [];
     const seen = new Set<string>();
     const decoder = new TextDecoder('utf-8', { fatal: true });
     let pending = Buffer.alloc(0);
     let unpackedBytes = 0;
+    let rootDirectory: string | null = null;
     const consumeLine = (bytes: Buffer): void => {
       let line: string;
       try {
@@ -123,7 +136,9 @@ function inspectEntries(archivePath: string): Effect.Effect<ArchiveInspection, M
       }
       if (line.endsWith('\r')) line = line.slice(0, -1);
       if (line.length === 0) return;
-      const entry = validateEntry(parseListingLine(line), seen);
+      const validated = validateEntry(parseListingLine(line), seen, expectedDirectory, rootDirectory);
+      rootDirectory = validated.rootDirectory;
+      const entry = validated.entry;
       if (entry.type === '-') {
         unpackedBytes += entry.size;
         if (unpackedBytes > limits.unpackedBytes) {
@@ -158,7 +173,8 @@ function inspectEntries(archivePath: string): Effect.Effect<ArchiveInspection, M
     if (manifestEntries.length !== 1) {
       yield* Effect.fail(new MynpmError('input', 'package archive must contain exactly one package/package.json file'));
     }
-    return { entries, unpackedBytes };
+    if (rootDirectory === null) invalid('package archive is empty');
+    return { entries, unpackedBytes, rootDirectory };
   });
 }
 
@@ -177,11 +193,12 @@ export function inspectPackageArchive(
     if (info.size > limits.tarballBytes) {
       yield* Effect.fail(new MynpmError('input', `package archive exceeds the ${formatBytes(limits.tarballBytes)} compressed size limit`));
     }
-    const inspected = yield* inspectEntries(archivePath);
+    const expectedDirectory = expectedIdentity.name.split('/').at(-1) ?? '';
+    const inspected = yield* inspectEntries(archivePath, expectedDirectory);
     const extracted: Buffer[] = [];
     let manifestSize = 0;
     yield* Effect.mapError(
-      runProcess(tarExecutable, ['-xOzf', archivePath, 'package/package.json'], {
+      runProcess(tarExecutable, ['-xOzf', archivePath, `${inspected.rootDirectory}/package.json`], {
         cwd: process.cwd(),
         env: { LC_ALL: 'C', TAR_OPTIONS: '' },
         timeoutMs: limits.requestMilliseconds,

@@ -2,7 +2,7 @@ import { MynpmError } from './errors.ts';
 import { validateArtifactRecord } from './inventory.ts';
 import type { ArtifactRecord, JsonObject, JsonValue, VerifiedVersionMetadata } from './inventory.ts';
 
-export const rendererVersion = 2;
+export const rendererVersion = 3;
 
 export interface PackumentFile {
   readonly name: string;
@@ -11,7 +11,7 @@ export interface PackumentFile {
   readonly bytes: Buffer;
 }
 
-const supportedRendererVersions = new Set<number>([1, rendererVersion]);
+const supportedRendererVersions = new Set<number>([1, 2, rendererVersion]);
 
 function invalid(message: string): never {
   throw new MynpmError('corrupt', message);
@@ -97,7 +97,11 @@ function versionDocument(record: ArtifactRecord, publicBaseUrl: string, renderVe
   const dist: JsonObject = { ...metadata.dist };
   delete dist.signatures;
   delete dist.attestations;
-  const tarballPath = renderVersion === 1 ? 'tarballs' : 'current/tarballs';
+  const tarballPath = renderVersion === 1
+    ? 'tarballs'
+    : renderVersion === 2
+      ? 'current/tarballs'
+      : 'current/-/tarballs';
   const tarball = new URL(`${tarballPath}/${record.artifact.sha512}.tgz`, publicBaseUrl).href;
   dist.tarball = tarball;
   dist.integrity = record.artifact.integrity;

@@ -8,7 +8,7 @@
   },
   "packageManager": "pnpm@12.15.0",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=26.0.0"
   },
   "scripts": {
     "test": "vitest run",

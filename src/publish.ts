@@ -10,7 +10,7 @@ import { canonicalJson, renderPackumentFiles, rendererVersion, type PackumentFil
 import { validateArtifactRecord, type ArtifactRecord, type Inventory } from './inventory.ts';
 import { errorCode, MynpmError, type ErrorCategory } from './errors.ts';
 
-type RendererVersion = 1 | typeof rendererVersion;
+type RendererVersion = 1 | 2 | typeof rendererVersion;
 type MynpmEffect<A> = Effect.Effect<A, MynpmError>;
 
 interface GenerationManifest {
@@ -48,14 +48,6 @@ interface PublishResult {
   noOp: boolean;
 }
 
-interface GenerationPayload {
-  schemaVersion: 1;
-  rendererVersion: RendererVersion;
-  publicBaseUrl: string;
-  artifacts: { name: string; version: string; sha512: string }[];
-  packuments: { path: string; contents: string }[];
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -85,7 +77,7 @@ function causeCode(cause: unknown): string | undefined {
 }
 
 function isRendererVersion(value: unknown): value is RendererVersion {
-  return value === 1 || value === rendererVersion;
+  return value === 1 || value === 2 || value === rendererVersion;
 }
 
 function sortedArtifacts(records: readonly unknown[]): MynpmEffect<ArtifactRecord[]> {
@@ -103,13 +95,27 @@ function generationPayload(
   artifacts: readonly ArtifactRecord[],
   packuments: readonly PackumentFile[],
   renderVersion: RendererVersion,
-): GenerationPayload {
-  return {
+): unknown {
+  const legacyPayload = {
     schemaVersion: 1,
     rendererVersion: renderVersion,
     publicBaseUrl,
     artifacts: artifacts.map(record => ({ name: record.name, version: record.version, sha512: record.artifact.sha512 })),
     packuments: packuments.map(file => ({ path: file.path, contents: file.bytes.toString('utf8') })),
+  };
+  if (renderVersion < 3) return legacyPayload;
+  return {
+    ...legacyPayload,
+    publicationLayout: 'current-dash-tarballs-v1',
+    artifacts: artifacts.map(record => ({
+      name: record.name,
+      version: record.version,
+      digests: {
+        sha512: record.artifact.sha512,
+        integrity: record.artifact.integrity,
+        shasum: record.artifact.shasum,
+      },
+    })),
   };
 }
 
@@ -283,7 +289,7 @@ function hashRegularFile(path: string, expectedDigest: string, category: ErrorCa
     );
     yield* Stream.runForEach(stream, chunk => Effect.sync(() => { digest.update(chunk); }));
     const actual = digest.digest('hex');
-    if (actual !== expectedDigest) return yield* failure(category, `SHA-512 mismatch for published artifact ${basename(path)}`);
+    if (actual !== expectedDigest) return yield* failure('corrupt', `SHA-512 mismatch for published artifact ${basename(path)}`);
     return actual;
   }));
 }
@@ -338,9 +344,12 @@ function validateGeneration(generationsDirectory: string, id: string, mirrorRoot
     );
     const computedId = generationIdForManifest(manifest, files);
     if (computedId !== id || manifest.generationId !== id) return yield* failure('corrupt', `generation identity does not match its contents: ${id}`);
+    const digests = [...new Set(manifest.artifacts.map(record => record.artifact.sha512))];
     const tarballAliases = manifest.rendererVersion === 1
       ? []
-      : [...new Set(manifest.artifacts.map(record => record.artifact.sha512))].map(digest => `tarballs/${digest}.tgz`);
+      : digests.flatMap(digest => manifest.rendererVersion === 2
+        ? [`tarballs/${digest}.tgz`]
+        : [`tarballs/${digest}.tgz`, `-/tarballs/${digest}.tgz`]);
     const expectedFiles = [...files.map(file => file.path), ...tarballAliases, 'manifest.json'].sort();
     const actualFiles = (yield* generationFiles(generationDirectory)).sort();
     if (canonicalJson(expectedFiles) !== canonicalJson(actualFiles)) return yield* failure('corrupt', `generation file set does not match its manifest: ${id}`);
@@ -352,6 +361,9 @@ function validateGeneration(generationsDirectory: string, id: string, mirrorRoot
       yield* hashRegularFile(join(mirrorRoot, 'tarballs', `${record.artifact.sha512}.tgz`), record.artifact.sha512, 'corrupt');
       if (manifest.rendererVersion !== 1) {
         yield* hashRegularFile(join(generationDirectory, 'tarballs', `${record.artifact.sha512}.tgz`), record.artifact.sha512, 'corrupt');
+      }
+      if (manifest.rendererVersion === 3) {
+        yield* hashRegularFile(join(generationDirectory, '-', 'tarballs', `${record.artifact.sha512}.tgz`), record.artifact.sha512, 'corrupt');
       }
     }
     return manifest;
@@ -448,7 +460,7 @@ function copyArtifact(
           state.destinationOpen = false;
           yield* closeSource();
           state.sourceOpen = false;
-          yield* tryIO(() => link(temporaryPath, destination), 'operation', `could not publish artifact ${record.name}@${record.version}`);
+          yield* tryIO(() => (dependencies.link ?? link)(temporaryPath, destination), 'operation', `could not publish artifact ${record.name}@${record.version}`);
         }),
         destinationHandle => Effect.gen(function*() {
           if (state.destinationOpen) yield* tryIO(() => destinationHandle.close(), 'operation', `could not close artifact ${temporaryPath}`);
@@ -505,16 +517,18 @@ function writeGenerationTarballAliases(
   return Effect.gen(function*() {
     const digests = [...new Set(artifacts.map(record => record.artifact.sha512))].sort();
     if (digests.length === 0) return;
-    const directoryPath = join(directory, 'tarballs');
-    yield* tryIO(() => mkdir(directoryPath, { mode: 0o755 }), 'operation', `could not create generation tarballs directory ${directoryPath}`);
-    for (const digest of digests) {
-      const alias = join(directoryPath, `${digest}.tgz`);
-      yield* tryIO(
-        () => (dependencies.link ?? link)(join(mirrorRoot, 'tarballs', `${digest}.tgz`), alias),
-        'operation',
-        `could not expose published artifact ${digest}`,
-      );
-      yield* hashRegularFile(alias, digest, 'operation');
+    for (const relativeDirectory of ['tarballs', join('-', 'tarballs')]) {
+      const directoryPath = join(directory, relativeDirectory);
+      yield* tryIO(() => mkdir(directoryPath, { recursive: true, mode: 0o755 }), 'operation', `could not create generation tarballs directory ${directoryPath}`);
+      for (const digest of digests) {
+        const alias = join(directoryPath, `${digest}.tgz`);
+        yield* tryIO(
+          () => (dependencies.link ?? link)(join(mirrorRoot, 'tarballs', `${digest}.tgz`), alias),
+          'operation',
+          `could not expose published artifact ${digest}`,
+        );
+        yield* hashRegularFile(alias, digest, 'corrupt');
+      }
     }
   });
 }

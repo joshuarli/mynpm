@@ -1,6 +1,7 @@
 import { createServer, type Server } from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { join, relative, resolve, sep } from 'node:path';
+import { createHash } from 'node:crypto';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { Effect } from 'effect';
 import { errorCode, MynpmError, type ErrorCategory } from './errors.ts';
 import type { MynpmConfig, TargetConfig } from './config.ts';
@@ -10,10 +11,22 @@ import { parseNpmLock } from './lock-npm.ts';
 import { parsePnpmLock } from './lock-pnpm.ts';
 import { managerVersions } from './resolve.ts';
 import { publishSite } from './publish.ts';
+import { assertRestorableProjectSnapshot } from './project-snapshot.ts';
 import { runProcess, type ProcessResult } from './process.ts';
+import { limits } from './limits.ts';
 
 type SelectedPackage = { identity: string; integrity: string };
-type StaticRequest = { method: string | undefined; pathname: string; prefix: string | null };
+type StaticRequest = {
+  method: string | undefined;
+  target: string;
+  pathname: string;
+  prefix: string | null;
+  status: number | null;
+  contentType: string | null;
+  responseBytes: number;
+  responseSha512: string | null;
+  complete: boolean;
+};
 type StaticServer = { server: Server; requests: StaticRequest[]; port: number };
 type StaticServerResource = { server: Server; requests: StaticRequest[] };
 type ValidationDependencies = { runProcess?: typeof runProcess };
@@ -26,6 +39,7 @@ type LockParseOptions = {
   snapshot: ProjectSnapshot | null;
 };
 type JsonObject = Record<string, unknown>;
+type InstalledPackageReport = { roots: JsonObject[]; nodes: JsonObject[] };
 
 const clientTimeoutMilliseconds = 60 * 60 * 1000;
 
@@ -172,6 +186,7 @@ function clientEnvironment(workspace: string, registry: string, cacheDirectory: 
     npm_config_ignore_scripts: 'true',
     npm_config_update_notifier: 'false',
     npm_config_fetch_retries: '0',
+    pnpm_config_ignore_pnpmfile: 'true',
     pnpm_config_store_dir: join(workspace, 'pnpm-store'),
     pnpm_config_pm_on_fail: 'ignore',
     pnpm_config_trust_lockfile: 'true',
@@ -205,62 +220,87 @@ function safeStaticPath(pathname: string, mountPrefix: string): string[] | null 
 function createStaticServer(mirrorDirectory: string): StaticServerResource {
   const requests: StaticRequest[] = [];
   const server = createServer((request, response) => {
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      response.writeHead(405).end();
-      return;
-    }
-    if (request.url === undefined) {
-      response.writeHead(400).end();
-      return;
-    }
+    const target = request.url ?? '';
     let pathname;
     try {
-      pathname = decodeURIComponent(new URL(request.url, 'http://127.0.0.1').pathname);
+      pathname = decodeURIComponent(new URL(target, 'http://127.0.0.1').pathname);
     } catch {
-      response.writeHead(400).end();
-      return;
+      pathname = target;
     }
     const prefix = pathname.startsWith('/mirror/')
       ? '/mirror/'
       : pathname.startsWith('/current/') || pathname.startsWith('/tarballs/')
         ? '/'
         : null;
-    requests.push({ method: request.method, pathname, prefix });
+    const record: StaticRequest = {
+      method: request.method,
+      target,
+      pathname,
+      prefix,
+      status: null,
+      contentType: null,
+      responseBytes: 0,
+      responseSha512: null,
+      complete: false,
+    };
+    requests.push(record);
+    response.once('finish', () => { record.complete = true; });
+    const send = (status: number, contentType: string | null = null, body: Buffer | null = null, cacheControl?: string): void => {
+      record.status = status;
+      record.contentType = contentType;
+      const responseBody = request.method === 'HEAD' ? null : body;
+      record.responseBytes = responseBody?.byteLength ?? 0;
+      record.responseSha512 = responseBody === null ? null : createHash('sha512').update(responseBody).digest('hex');
+      response.writeHead(status, {
+        ...(contentType === null ? {} : { 'Content-Type': contentType }),
+        ...(cacheControl === undefined ? {} : { 'Cache-Control': cacheControl }),
+        ...(body === null ? {} : { 'Content-Length': body.byteLength }),
+      });
+      response.end(responseBody ?? undefined);
+    };
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      send(405);
+      return;
+    }
+    if (request.url === undefined) {
+      send(400);
+      return;
+    }
     if (prefix === null) {
-      response.writeHead(404).end();
+      send(404);
       return;
     }
     const segments = safeStaticPath(pathname, prefix);
     if (segments === null || segments.length === 0) {
-      response.writeHead(404).end();
+      send(404);
       return;
     }
-    if (segments[0] !== 'current' && segments[0] !== 'tarballs') {
-      response.writeHead(404).end();
+    const isLegacyTarball = segments[0] === 'tarballs' && segments.length === 2;
+    const isNestedTarball = segments[0] === 'current' && segments[1] === '-' && segments[2] === 'tarballs' && segments.length === 4;
+    const isRendererTwoTarball = segments[0] === 'current' && segments[1] === 'tarballs' && segments.length === 3;
+    const isMetadata = segments[0] === 'current' && segments.length >= 2 && segments[1] !== '-';
+    if (!isLegacyTarball && !isNestedTarball && !isRendererTwoTarball && !isMetadata) {
+      send(404);
       return;
     }
     const filePath = resolve(mirrorDirectory, ...segments);
     const pathFromRoot = relative(mirrorDirectory, filePath);
     if (pathFromRoot === '..' || pathFromRoot.startsWith(`..${sep}`)) {
-      response.writeHead(404).end();
+      send(404);
       return;
     }
-    const metadata = segments[0] === 'current' && segments[1] !== 'tarballs';
     const serveFile = Effect.gen(function*() {
       const bytes = yield* promiseEffect(() => readFile(filePath), 'operation', `could not read local registry file ${filePath}`);
       yield* syncEffect(() => {
-        response.writeHead(200, {
-          'Content-Type': metadata ? 'application/json' : 'application/octet-stream',
-          'Cache-Control': metadata ? 'no-cache' : 'public, max-age=31536000, immutable',
-        });
-        response.end(request.method === 'HEAD' ? undefined : bytes);
+        const metadataResponse = isMetadata;
+        send(200, metadataResponse ? 'application/json' : 'application/octet-stream', bytes, metadataResponse ? 'no-cache' : 'public, max-age=31536000, immutable');
       }, 'operation', `could not respond to local registry request ${pathname}`);
     });
     void Effect.runPromise(serveFile).catch(cause => {
       if (response.destroyed) return;
       const originalCause = cause instanceof MynpmError ? cause.cause : cause;
       try {
-        response.writeHead(errorCode(originalCause) === 'ENOENT' ? 404 : 500).end();
+        send(errorCode(originalCause) === 'ENOENT' ? 404 : 500);
       } catch (responseCause) {
         response.destroy(responseCause instanceof Error ? responseCause : undefined);
       }
@@ -501,6 +541,7 @@ function assertSnapshotMatchesProject(project: ProjectRecord, target: TargetConf
   return Effect.gen(function*() {
     yield* assertSnapshotRestorable(project);
     const snapshot = yield* syncEffect(() => projectSnapshot(project), 'input', `validation requires an imported snapshot for ${project.id}`);
+    yield* syncEffect(() => assertRestorableProjectSnapshot(project.manager, snapshot), 'input', `saved project configuration is not restorable for ${project.id}`);
     const restored = yield* parseProjectLock(project.manager, snapshot.lockfile, {
       projectId: project.id,
       packageManagerPin: project.packageManagerPin,
@@ -534,11 +575,11 @@ function packageArtifact(project: ProjectRecord, item: PackageRecord, artifacts:
 }
 
 function localTarballUrl(registry: string, digest: string): string {
-  return new URL(`tarballs/${digest}.tgz`, registry).href;
+  return new URL(`-/tarballs/${digest}.tgz`, registry).href;
 }
 
 function unavailableTarballUrl(registry: string): string {
-  return new URL('tarballs/unavailable.tgz', registry).href;
+  return new URL('-/tarballs/unavailable.tgz', registry).href;
 }
 
 function rewriteNpmLock(project: ProjectRecord, target: TargetConfig, artifacts: readonly ArtifactRecord[], registry: string): Effect.Effect<string, MynpmError> {
@@ -555,8 +596,57 @@ function rewriteNpmLock(project: ProjectRecord, target: TargetConfig, artifacts:
         ? localTarballUrl(registry, packageArtifact(project, item, artifacts).artifact.sha512)
         : unavailableTarballUrl(registry);
     }
+    rewriteNpmLegacyDependencies(lock, project, target, artifacts, registry);
     return `${JSON.stringify(lock, null, 2)}\n`;
   }, 'corrupt', `could not migrate saved npm lockfile for ${project.id}`);
+}
+
+function rewriteNpmLegacyDependencies(
+  lock: JsonObject,
+  project: ProjectRecord,
+  target: TargetConfig,
+  artifacts: readonly ArtifactRecord[],
+  registry: string,
+): void {
+  if (lock.dependencies === undefined) return;
+  const packageByKey = new Map(project.packages.map(item => [item.key, item]));
+  const visit = (entries: unknown, parentPath: string): void => {
+    const dependencies = requireRecord(entries, `saved npm legacy dependencies for ${project.id}`, 'corrupt');
+    for (const [requestedName, rawEntry] of Object.entries(dependencies)) {
+      const entry = requireRecord(rawEntry, `saved npm legacy dependency ${requestedName} for ${project.id}`, 'corrupt');
+      const key = parentPath === ''
+        ? `node_modules/${requestedName}`
+        : `${parentPath}/node_modules/${requestedName}`;
+      const item = packageByKey.get(key);
+      if (item !== undefined && item.version !== null && item.sourceKind === 'registry') {
+        entry.resolved = supportsTarget(item.platform, target)
+          ? localTarballUrl(registry, packageArtifact(project, item, artifacts).artifact.sha512)
+          : unavailableTarballUrl(registry);
+      }
+      if (entry.dependencies !== undefined) visit(entry.dependencies, key);
+    }
+  };
+  visit(lock.dependencies, '');
+}
+
+function normalizeNpmLegacyDependencies(lock: JsonObject, project: ProjectRecord): void {
+  if (lock.dependencies === undefined) return;
+  const packageByKey = new Map(project.packages.map(item => [item.key, item]));
+  const visit = (entries: unknown, parentPath: string): void => {
+    const dependencies = requireRecord(entries, `npm legacy dependencies for ${project.id}`, 'corrupt');
+    for (const [requestedName, rawEntry] of Object.entries(dependencies)) {
+      const entry = requireRecord(rawEntry, `npm legacy dependency ${requestedName} for ${project.id}`, 'corrupt');
+      const key = parentPath === ''
+        ? `node_modules/${requestedName}`
+        : `${parentPath}/node_modules/${requestedName}`;
+      const item = packageByKey.get(key);
+      if (item !== undefined && item.version !== null && item.sourceKind === 'registry') {
+        entry.resolved = 'mynpm-local-tarball';
+      }
+      if (entry.dependencies !== undefined) visit(entry.dependencies, key);
+    }
+  };
+  visit(lock.dependencies, '');
 }
 
 function rewritePnpmLock(project: ProjectRecord, target: TargetConfig, artifacts: readonly ArtifactRecord[], registry: string): Effect.Effect<string, MynpmError> {
@@ -602,6 +692,8 @@ function assertMigrationPreservesGraph(project: ProjectRecord, migratedLock: str
           originalEntry.resolved = 'mynpm-local-tarball';
           migratedEntry.resolved = 'mynpm-local-tarball';
         }
+        normalizeNpmLegacyDependencies(original, project);
+        normalizeNpmLegacyDependencies(migrated, project);
         if (canonicalText(original) !== canonicalText(migrated)) fail('conflict', `registry migration changed the saved npm dependency graph for ${project.id}`);
       }, 'conflict', `registry migration changed the saved npm dependency graph for ${project.id}`);
       return;
@@ -635,6 +727,7 @@ function lockGraph(manager: PackageManager, text: string, project: ProjectRecord
         if (!isRecord(entry)) fail('corrupt', `saved npm lockfile is missing ${item.key}`);
         entry.resolved = 'mynpm-local-tarball';
       }
+      normalizeNpmLegacyDependencies(lock, project);
       return lock;
     }, 'input', `could not read npm lockfile for ${project.id}`);
   }
@@ -662,6 +755,301 @@ function assertLockfileMatches(manager: PackageManager, expectedText: string, ac
     yield* syncEffect(() => {
       if (canonicalText(expected) !== canonicalText(actual)) fail('conflict', `${manager} changed the saved dependency graph for ${project.id}`);
     }, 'conflict', `${manager} changed the saved dependency graph for ${project.id}`);
+  });
+}
+
+type ExpectedInstance = { key: string; name: string; version: string; optional: boolean };
+type InstallCoverage = { instanceCount: number; platformSkippedCount: number };
+
+function packageReportNodes(value: unknown, output: JsonObject[] = [], seenPaths = new Set<string>(), topLevel = true, dependencyName?: string): JsonObject[] {
+  if (Array.isArray(value)) {
+    for (const item of value) packageReportNodes(item, output, seenPaths, true);
+    return output;
+  }
+  if (!isRecord(value)) return output;
+  const path = typeof value.path === 'string' ? value.path : null;
+  const name = typeof value.name === 'string' ? value.name : dependencyName;
+  if (!topLevel && name !== undefined && typeof value.version === 'string' && (path === null || !seenPaths.has(path))) {
+    output.push({ ...value, name });
+    if (path !== null) seenPaths.add(path);
+  }
+  if (isRecord(value.dependencies)) {
+    for (const [childName, child] of Object.entries(value.dependencies)) {
+      packageReportNodes(child, output, seenPaths, false, childName);
+    }
+  }
+  return output;
+}
+
+function packageIdentityCounts(instances: readonly { name: string; version: string }[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const instance of instances) {
+    const identity = `${instance.name}\0${instance.version}`;
+    counts.set(identity, (counts.get(identity) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function expectedPnpmInstances(project: ProjectRecord, target: TargetConfig): Effect.Effect<{ instances: ExpectedInstance[]; platformSkippedCount: number; platformSkippedIdentities: Set<string> }, MynpmError> {
+  return Effect.gen(function*() {
+    const snapshot = yield* syncEffect(() => projectSnapshot(project), 'input', `validation requires a saved snapshot for ${project.id}`);
+    const { values } = yield* pnpmDocuments(snapshot.lockfile);
+    return yield* syncEffect(() => {
+      const packages = new Map(project.packages.map(item => [item.key.startsWith('/') ? item.key.slice(1) : item.key, item]));
+      const snapshots = new Map<string, JsonObject>();
+      for (const [documentIndex, document] of values.entries()) {
+        const lock = requireRecord(document, `saved pnpm lockfile document ${documentIndex}`, 'corrupt');
+        if (lock.snapshots === undefined) continue;
+        for (const [key, value] of Object.entries(requireRecord(lock.snapshots, `saved pnpm lockfile document ${documentIndex}.snapshots`, 'corrupt'))) {
+          snapshots.set(key.startsWith('/') ? key.slice(1) : key, requireRecord(value, `saved pnpm snapshot ${key}`, 'corrupt'));
+        }
+      }
+      let platformSkippedCount = 0;
+      const platformSkippedIdentities = new Set<string>();
+      const instances: ExpectedInstance[] = [];
+      for (const [key, snapshot] of snapshots) {
+        const artifactKey = key.split('(', 1)[0];
+        const item = packages.get(artifactKey);
+        if (item === undefined) fail('corrupt', `saved pnpm snapshot has no package entry: ${key}`);
+        if (item.version === null || item.sourceKind === 'local') continue;
+        const optional = item.flags.optional || snapshot.optional === true;
+        if (!supportsTarget(item.platform, target)) {
+          if (!optional) fail('conflict', `required pnpm package ${item.name}@${item.version} does not support target ${target.id}`);
+          platformSkippedCount += 1;
+          platformSkippedIdentities.add(`${item.name}\0${item.version}`);
+          continue;
+        }
+        instances.push({ key, name: item.name, version: item.version, optional });
+      }
+      return { instances, platformSkippedCount, platformSkippedIdentities };
+    }, 'corrupt', `could not inspect saved pnpm installation graph for ${project.id}`);
+  });
+}
+
+function expectedNpmInstances(project: ProjectRecord, target: TargetConfig): Effect.Effect<{ instances: ExpectedInstance[]; platformSkippedCount: number; platformSkippedIdentities: Set<string> }, MynpmError> {
+  return syncEffect(() => {
+    let platformSkippedCount = 0;
+    const platformSkippedIdentities = new Set<string>();
+    const instances: ExpectedInstance[] = [];
+    for (const item of project.packages) {
+      if (!item.key.startsWith('node_modules/') || item.version === null) continue;
+      if (!supportsTarget(item.platform, target)) {
+        if (!item.flags.optional) fail('conflict', `required npm package ${item.name}@${item.version} does not support target ${target.id}`);
+        platformSkippedCount += 1;
+        platformSkippedIdentities.add(`${item.name}\0${item.version}`);
+        continue;
+      }
+      instances.push({ key: item.key, name: item.name, version: item.version, optional: item.flags.optional });
+    }
+    return { instances, platformSkippedCount, platformSkippedIdentities };
+  }, 'corrupt', `could not inspect saved npm installation graph for ${project.id}`);
+}
+
+function inspectInstalledPackage(projectDirectory: string, instance: ExpectedInstance): Effect.Effect<{ name: string; version: string }, MynpmError> {
+  return Effect.gen(function*() {
+    const segments = instance.key.split('/');
+    if (segments.some(segment => segment === '' || segment === '.' || segment === '..' || segment.includes('\\'))) {
+      return yield* Effect.fail(new MynpmError('corrupt', `saved lockfile contains an unsafe installed package path: ${instance.key}`));
+    }
+    const packageDirectory = join(projectDirectory, ...segments);
+    const resolvedDirectory = yield* promiseEffect(() => realpath(packageDirectory), 'conflict', `applicable ${instance.optional ? 'optional' : 'required'} package ${instance.name}@${instance.version} is missing from the installed tree at ${instance.key}`);
+    const projectRoot = yield* promiseEffect(() => realpath(projectDirectory), 'operation', `could not resolve restored project directory ${projectDirectory}`);
+    const pathFromRoot = relative(projectRoot, resolvedDirectory);
+    if (pathFromRoot === '..' || pathFromRoot.startsWith(`..${sep}`) || pathFromRoot.startsWith(sep)) {
+      return yield* Effect.fail(new MynpmError('conflict', `installed package path leaves restored project: ${instance.key}`));
+    }
+    const packageJsonPath = join(resolvedDirectory, 'package.json');
+    const packageJsonInfo = yield* promiseEffect(() => lstat(packageJsonPath), 'conflict', `installed package ${instance.name}@${instance.version} has no package.json at ${instance.key}`);
+    if (!packageJsonInfo.isFile() || packageJsonInfo.isSymbolicLink()) {
+      return yield* Effect.fail(new MynpmError('conflict', `installed package ${instance.name}@${instance.version} has an unsafe package.json at ${instance.key}`));
+    }
+    const text = yield* promiseEffect(() => readFile(packageJsonPath, 'utf8'), 'conflict', `could not read installed package ${instance.key}/package.json`);
+    const manifest = yield* syncEffect(() => requireRecord(parseJson(text, `installed package ${instance.key}/package.json`, 'conflict'), `installed package ${instance.key}/package.json`, 'conflict'), 'conflict', `installed package ${instance.key} has invalid metadata`);
+    const name = typeof manifest.name === 'string' ? manifest.name : '';
+    const version = typeof manifest.version === 'string' ? manifest.version : '';
+    if (name !== instance.name || version !== instance.version) {
+      return yield* Effect.fail(new MynpmError('conflict', `installed package at ${instance.key} is ${name || 'unnamed'}@${version || 'unversioned'}, expected ${instance.name}@${instance.version}`));
+    }
+    return { name, version };
+  });
+}
+
+function packageReport(client: PackageManager, projectDirectory: string, environment: NodeJS.ProcessEnv, dependencies: ValidationDependencies): Effect.Effect<InstalledPackageReport, MynpmError> {
+  return Effect.gen(function*() {
+    const args = client === 'npm'
+      ? ['ls', '--all', '--json', '--long', '--ignore-scripts']
+      : ['list', '--recursive', '--depth', 'Infinity', '--json', '--ignore-pnpmfile'];
+    const stdoutChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    const result = yield* Effect.result(processEffect(dependencies, client, args, {
+      cwd: projectDirectory,
+      env: environment,
+      timeoutMs: clientTimeoutMilliseconds,
+      onStdout: chunk => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > limits.packageReportBytes) {
+          fail('conflict', `${client} installed package report exceeds ${limits.packageReportBytes} bytes`);
+        }
+        stdoutChunks.push(Buffer.from(chunk));
+      },
+    }));
+    if (result._tag === 'Failure') {
+      const cause = result.failure;
+      return yield* Effect.fail(new MynpmError('conflict', `${client} reported an invalid or incomplete installed dependency graph for ${projectDirectory}`, { cause }));
+    }
+    return yield* syncEffect(() => {
+      const stdout = stdoutBytes === 0 ? result.success.stdout : Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8');
+      const report = parseJson(stdout, `${client} installed package report`, 'conflict');
+      const roots = Array.isArray(report) ? report : [report];
+      const problems = roots.flatMap(root => isRecord(root) && Array.isArray(root.problems) ? root.problems.filter(item => typeof item === 'string') : []);
+      if (problems.length > 0) fail('conflict', `${client} reports installed dependency problems: ${problems.slice(0, 3).join('; ')}`);
+      const nodes = packageReportNodes(roots);
+      const packages = client === 'pnpm'
+        ? nodes.filter(node => typeof node.path === 'string' && node.path.includes(`${sep}node_modules${sep}.pnpm${sep}`))
+        : nodes;
+      return { roots, nodes: packages };
+    }, 'conflict', `${client} returned an invalid installed package report`);
+  });
+}
+
+function verifyReportedDependencyLinks(
+  roots: readonly JsonObject[],
+  projectDirectory: string,
+  platformSkippedIdentities: ReadonlySet<string>,
+): Effect.Effect<void, MynpmError> {
+  return Effect.gen(function*() {
+    const projectRoot = yield* promiseEffect(() => realpath(projectDirectory), 'operation', `could not resolve restored project directory ${projectDirectory}`);
+    const visited = new Set<string>();
+    const visit = function*(node: JsonObject): Generator<Effect.Effect<unknown, MynpmError>, void, unknown> {
+      if (typeof node.path !== 'string') return;
+      const parentPath = yield* promiseEffect(() => realpath(node.path as string), 'conflict', 'package report path is missing from the installed tree');
+      const parentRelative = relative(projectRoot, parentPath);
+      if (parentRelative === '..' || parentRelative.startsWith(`..${sep}`) || parentRelative.startsWith(sep)) {
+        return yield* Effect.fail(new MynpmError('conflict', 'package report path leaves the restored project'));
+      }
+      if (visited.has(parentPath)) return;
+      visited.add(parentPath);
+      if (!isRecord(node.dependencies)) return;
+      for (const [dependencyName, childValue] of Object.entries(node.dependencies)) {
+        if (!isRecord(childValue) || typeof childValue.path !== 'string') continue;
+        const childPackageName = typeof childValue.name === 'string' ? childValue.name : dependencyName;
+        if (typeof childValue.version === 'string' && platformSkippedIdentities.has(`${childPackageName}\0${childValue.version}`)) continue;
+        const segments = dependencyName.split('/');
+        if (segments.some(segment => segment === '' || segment === '.' || segment === '..' || segment.includes('\\'))) {
+          return yield* Effect.fail(new MynpmError('conflict', `package report contains an unsafe dependency name: ${dependencyName}`));
+        }
+        const childPath = yield* promiseEffect(() => realpath(childValue.path as string), 'conflict', `reported dependency ${dependencyName} is missing from the installed tree`);
+        let searchPath = parentPath;
+        let linkedPath: string | null = null;
+        while (true) {
+          const candidate = join(searchPath, 'node_modules', ...segments);
+          const info = yield* promiseEffect(
+            () => lstat(candidate).catch(cause => errorCode(cause) === 'ENOENT' ? null : Promise.reject(cause)),
+            'conflict',
+            `could not inspect installed dependency link ${candidate}`,
+          );
+          if (info !== null) {
+            const targetPath = yield* promiseEffect(() => realpath(candidate), 'conflict', `installed dependency link ${candidate} is broken`);
+            if (targetPath !== childPath) {
+              return yield* Effect.fail(new MynpmError('conflict', `installed dependency link ${dependencyName} points to a different package instance`));
+            }
+            linkedPath = candidate;
+            break;
+          }
+          if (searchPath === projectRoot) break;
+          const parentSearchPath = dirname(searchPath);
+          const parentRelative = relative(projectRoot, parentSearchPath);
+          if (parentSearchPath === searchPath || parentRelative === '..' || parentRelative.startsWith(`..${sep}`) || parentRelative.startsWith(sep)) break;
+          searchPath = parentSearchPath;
+        }
+        if (linkedPath === null) {
+          return yield* Effect.fail(new MynpmError('conflict', `installed dependency link ${dependencyName} is missing`));
+        }
+        yield* visit(childValue);
+      }
+    };
+    for (const root of roots) yield* visit(root);
+  });
+}
+
+function assertReportMatchesExpected(
+  report: readonly JsonObject[],
+  expected: readonly ExpectedInstance[],
+  client: PackageManager,
+  projectId: string,
+  projectDirectory: string,
+): void {
+  const expectedByPath = new Map(expected.map(instance => [instance.key, instance]));
+  const actualInstances = report.flatMap(item => {
+    if (typeof item.version !== 'string') return [];
+    if (typeof item.path === 'string') {
+      const pathFromProject = relative(projectDirectory, item.path);
+      if (pathFromProject === '..' || pathFromProject.startsWith(`..${sep}`) || pathFromProject.startsWith(sep)) {
+        fail('conflict', `${client} package report points outside the restored project for ${projectId}`);
+      }
+      const installed = expectedByPath.get(pathFromProject.split(sep).join('/'));
+      if (installed !== undefined) return [{ name: installed.name, version: item.version }];
+    }
+    return typeof item.name === 'string' ? [{ name: item.name, version: item.version }] : [];
+  });
+  const expectedCounts = packageIdentityCounts(expected);
+  const actualCounts = packageIdentityCounts(actualInstances);
+  const identities = new Set([...expectedCounts.keys(), ...actualCounts.keys()]);
+  const mismatch = [...identities].find(identity => expectedCounts.get(identity) !== actualCounts.get(identity));
+  if (mismatch !== undefined) {
+    const separator = mismatch.indexOf('\0');
+    const identity = `${mismatch.slice(0, separator)}@${mismatch.slice(separator + 1)}`;
+    const expectedCount = expectedCounts.get(mismatch) ?? 0;
+    const actualCount = actualCounts.get(mismatch) ?? 0;
+    fail('conflict', `${client} installed package report for ${projectId} does not match the selected graph at ${identity}; expected ${expectedCount} instance(s), found ${actualCount}`);
+  }
+}
+
+function verifyInstalledTree(
+  projectDirectory: string,
+  project: ProjectRecord,
+  target: TargetConfig,
+  client: PackageManager,
+  environment: NodeJS.ProcessEnv,
+  dependencies: ValidationDependencies,
+): Effect.Effect<InstallCoverage, MynpmError> {
+  return Effect.gen(function*() {
+    const expected = client === 'npm'
+      ? yield* expectedNpmInstances(project, target)
+      : yield* expectedPnpmInstances(project, target);
+    const expectedOptionalIdentities = new Set(expected.instances
+      .filter(instance => instance.optional)
+      .map(instance => `${instance.name}\0${instance.version}`));
+    if (client === 'npm') {
+      for (const instance of expected.instances) yield* inspectInstalledPackage(projectDirectory, instance);
+    }
+    const report = yield* packageReport(client, projectDirectory, environment, dependencies);
+    const installedReportNodes = report.nodes.filter(node => {
+      const identity = typeof node.name === 'string' && typeof node.version === 'string'
+        ? `${node.name}\0${node.version}`
+        : null;
+      return identity === null || !expected.platformSkippedIdentities.has(identity);
+    });
+    if (client === 'pnpm') {
+      for (const node of installedReportNodes) {
+        if (typeof node.path !== 'string' || typeof node.name !== 'string' || typeof node.version !== 'string') {
+          return yield* Effect.fail(new MynpmError('conflict', `pnpm package report omitted an installed package path for ${project.id}`));
+        }
+        const pathFromProject = relative(projectDirectory, node.path);
+        if (pathFromProject === '..' || pathFromProject.startsWith(`..${sep}`) || pathFromProject.startsWith(sep)) {
+          return yield* Effect.fail(new MynpmError('conflict', `pnpm package report points outside the restored project for ${project.id}`));
+        }
+        yield* inspectInstalledPackage(projectDirectory, {
+          key: pathFromProject.split(sep).join('/'),
+          name: node.name,
+          version: node.version,
+          optional: expectedOptionalIdentities.has(`${node.name}\0${node.version}`),
+        });
+      }
+    }
+    yield* verifyReportedDependencyLinks(report.roots, projectDirectory, expected.platformSkippedIdentities);
+    yield* syncEffect(() => assertReportMatchesExpected(installedReportNodes, expected.instances, client, project.id, projectDirectory), 'conflict', `${client} installed package report changed the selected graph for ${project.id}`);
+    return { instanceCount: expected.instances.length, platformSkippedCount: expected.platformSkippedCount };
   });
 }
 
@@ -705,6 +1093,47 @@ function checkExecutables(
   });
 }
 
+function assertProjectStaticResponses(
+  requests: readonly StaticRequest[],
+  publicPrefix: string,
+  project: ProjectRecord,
+  target: TargetConfig,
+  artifacts: readonly ArtifactRecord[],
+): void {
+  const expectedNames = new Map<string, string[]>();
+  const expectedDigests = new Set<string>();
+  for (const item of project.packages) {
+    if (item.version === null || item.sourceKind !== 'registry' || !supportsTarget(item.platform, target)) continue;
+    const digest = packageArtifact(project, item, artifacts).artifact.sha512;
+    expectedDigests.add(digest);
+    const names = expectedNames.get(digest) ?? [];
+    names.push(`${item.name}@${item.version}`);
+    expectedNames.set(digest, names);
+  }
+  for (const request of requests) {
+    const platformSkip = request.pathname.endsWith('/current/-/tarballs/unavailable.tgz')
+      && request.method === 'GET'
+      && request.status === 404
+      && request.complete;
+    if (!request.complete || (request.status !== 200 && !platformSkip)) {
+      const digest = /\/([a-f0-9]{128})\.tgz$/.exec(request.pathname)?.[1];
+      const identity = digest === undefined ? undefined : expectedNames.get(digest)?.join(', ');
+      fail('conflict', `local static server returned HTTP ${request.status ?? 'incomplete'} for ${request.pathname}${identity === undefined ? '' : ` (${identity})`}`);
+    }
+  }
+  for (const digest of expectedDigests) {
+    const pathname = `${publicPrefix}current/-/tarballs/${digest}.tgz`;
+    const matching = requests.filter(request => request.pathname === pathname && request.method === 'GET');
+    const corrupt = matching.find(request => request.status === 200 && request.responseSha512 !== digest);
+    if (corrupt !== undefined) fail('corrupt', `local static server returned corrupted tarball bytes for ${pathname} (${expectedNames.get(digest)?.join(', ')})`);
+    const response = matching.find(request => request.status === 200 && request.complete && request.responseSha512 === digest);
+    if (response === undefined) fail('conflict', `package manager did not fetch expected applicable artifact ${pathname} (${expectedNames.get(digest)?.join(', ')})`);
+    if (response.contentType !== 'application/octet-stream') {
+      fail('conflict', `local server returned the wrong content type for tarball ${pathname}`);
+    }
+  }
+}
+
 function writeProjectSnapshot(projectDirectory: string, project: ProjectRecord, lockText: string, lockfileName: string): Effect.Effect<void, MynpmError> {
   return Effect.gen(function*() {
     const snapshot = yield* syncEffect(() => projectSnapshot(project), 'input', `validation requires a saved snapshot for ${project.id}`);
@@ -744,6 +1173,7 @@ function installProject({
   registry,
   localOrigin,
   projectNumber,
+  smokeExecutables,
   dependencies,
 }: {
   client: PackageManager;
@@ -753,8 +1183,9 @@ function installProject({
   registry: string;
   localOrigin: string;
   projectNumber: number;
+  smokeExecutables: boolean;
   dependencies: InstallDependencies;
-}): Effect.Effect<{ selection: SelectedPackage[]; executables: Record<string, string> }, MynpmError> {
+}): Effect.Effect<{ selection: SelectedPackage[]; coverage: InstallCoverage; executables: Record<string, string> }, MynpmError> {
   return Effect.gen(function*() {
     const projectDirectory = join(workspace, 'projects', `${packageSlug(project.id)}-${projectNumber}`);
     const installWorkspace = join(workspace, 'clients', `${packageSlug(project.id)}-${projectNumber}`);
@@ -768,8 +1199,17 @@ function installProject({
     const cacheDirectory = join(installWorkspace, 'cache');
     const environment = yield* createClientEnvironment(installWorkspace, registry, cacheDirectory);
     const args = client === 'npm'
-      ? ['ci', `--registry=${registry}`, `--cache=${cacheDirectory}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0']
-      : ['install', '--frozen-lockfile', `--registry=${registry}`, `--store-dir=${join(installWorkspace, 'pnpm-store')}`, '--ignore-scripts'];
+      ? [
+        'ci',
+        `--registry=${registry}`,
+        `--cache=${cacheDirectory}`,
+        '--ignore-scripts',
+        '--no-audit',
+        '--no-fund',
+        '--fetch-retries=0',
+        ...npmSnapshotInstallArgs(project),
+      ]
+      : ['install', '--frozen-lockfile', `--registry=${registry}`, `--store-dir=${join(installWorkspace, 'pnpm-store')}`, '--ignore-scripts', '--ignore-pnpmfile'];
     yield* processEffect(dependencies, client, args, { cwd: projectDirectory, env: environment, timeoutMs: clientTimeoutMilliseconds });
     const actualLock = yield* promiseEffect(
       () => readFile(join(projectDirectory, lockfileName), 'utf8'),
@@ -784,12 +1224,27 @@ function installProject({
       snapshot: null,
     });
     yield* assertLockfileMatches(client, migratedLock, actualLock, project);
+    const coverage = yield* verifyInstalledTree(projectDirectory, project, target, client, environment, dependencies);
     const selection = yield* syncEffect(() => packageSelection(actualProject, target, dependencies.artifacts, { allowLocalHost: true, localOrigin }), 'conflict', `could not verify restored package selection for ${project.id}`);
     yield* assertProjectFilesUnchanged(projectDirectory, project, lockfileName);
     const roots = project.roots.filter(root => root.importer === '.');
-    const executables = yield* checkExecutables(projectDirectory, project, roots, target, environment, dependencies);
-    return { selection, executables };
+    const executables = smokeExecutables
+      ? yield* checkExecutables(projectDirectory, project, roots, target, environment, dependencies)
+      : {};
+    return { selection, coverage, executables };
   });
+}
+
+function npmSnapshotInstallArgs(project: ProjectRecord): string[] {
+  const options = projectSnapshot(project).npmInstallOptions;
+  const args: string[] = [];
+  if (options?.legacyPeerDeps !== null && options?.legacyPeerDeps !== undefined) {
+    args.push(`--legacy-peer-deps=${options.legacyPeerDeps}`);
+  }
+  if (options?.installLinks !== null && options?.installLinks !== undefined) {
+    args.push(`--install-links=${options.installLinks}`);
+  }
+  return args;
 }
 
 export interface ValidateInventoryOptions {
@@ -797,6 +1252,7 @@ export interface ValidateInventoryOptions {
   stateDirectory: string;
   config: MynpmConfig;
   cwd?: string;
+  smokeExecutables?: boolean;
 }
 
 export interface ValidationResult {
@@ -805,6 +1261,7 @@ export interface ValidationResult {
   nodeVersion: string;
   target: string;
   packageCount: number;
+  platformSkippedCount: number;
   projectCount: number;
   rootCount: number;
   requestCount: number;
@@ -813,7 +1270,7 @@ export interface ValidationResult {
 }
 
 export function validateInventory(
-  { client, stateDirectory, config, cwd = process.cwd() }: ValidateInventoryOptions,
+  { client, stateDirectory, config, cwd = process.cwd(), smokeExecutables = false }: ValidateInventoryOptions,
   dependencies: ValidationDependencies = {},
 ): Effect.Effect<ValidationResult, MynpmError> {
   return Effect.gen(function*() {
@@ -827,6 +1284,13 @@ export function validateInventory(
     return yield* Effect.acquireUseRelease(
       promiseEffect(() => mkdtemp(join(scratchRoot, 'mynpm-validate-')), 'operation', 'could not create validation workspace'),
       workspace => Effect.gen(function*() {
+        for (const project of projects) yield* assertSnapshotMatchesProject(project, target);
+        const artifacts = inventory.artifacts;
+        const expectedByProject = yield* syncEffect(
+          () => new Map<ProjectRecord, SelectedPackage[]>(projects.map(project => [project, packageSelection(project, target, artifacts)])),
+          'conflict',
+          'could not verify imported package selections',
+        );
         const siteDirectory = join(workspace, 'site');
         const mirrorDirectory = join(siteDirectory, 'mirror');
         yield* promiseEffect(() => mkdir(mirrorDirectory, { recursive: true, mode: 0o700 }), 'operation', `could not create local site directory ${mirrorDirectory}`);
@@ -836,16 +1300,10 @@ export function validateInventory(
             const staticServer = yield* listenStaticServer(resource);
             const origin = `http://127.0.0.1:${staticServer.port}`;
             const environment = yield* createClientEnvironment(workspace, `${origin}/current/`, join(workspace, 'tool-cache'));
-            const version = yield* checkClientVersion(client, target, cwd, environment, dependencies);
-            const artifacts = inventory.artifacts;
-            for (const project of projects) yield* assertSnapshotMatchesProject(project, target);
-            const expectedByProject = yield* syncEffect(
-              () => new Map<ProjectRecord, SelectedPackage[]>(projects.map(project => [project, packageSelection(project, target, artifacts)])),
-              'conflict',
-              'could not verify imported package selections',
-            );
+            const version = yield* checkClientVersion(client, target, workspace, environment, dependencies);
             let projectNumber = 0;
             const validatedSelections = new Set<string>();
+            let platformSkippedCount = 0;
             const executableResults: Array<{ name: string; output: string }> = [];
             let finalGenerationId: string | undefined;
             for (const mount of ['/mirror/', '/']) {
@@ -855,7 +1313,8 @@ export function validateInventory(
               const registry = `${publicBaseUrl}current/`;
               for (const project of projects) {
                 projectNumber += 1;
-                const result = yield* installProject({
+                const requestStart = staticServer.requests.length;
+                const installResult = yield* Effect.result(installProject({
                   client,
                   project,
                   target,
@@ -863,17 +1322,33 @@ export function validateInventory(
                   registry,
                   localOrigin: origin,
                   projectNumber,
+                  smokeExecutables,
                   dependencies: { ...dependencies, artifacts },
-                });
+                }));
+                yield* syncEffect(
+                  () => assertProjectStaticResponses(staticServer.requests.slice(requestStart), mount, project, target, artifacts),
+                  'conflict',
+                  `local static responses were incomplete for ${project.id}`,
+                );
+                if (installResult._tag === 'Failure') return yield* Effect.fail(installResult.failure);
+                const result = installResult.success;
                 const expected = expectedByProject.get(project);
                 if (expected === undefined) return yield* Effect.fail(new MynpmError('corrupt', `validation lost the expected package selection for ${project.id}`));
                 yield* syncEffect(() => compareSelections(expected, result.selection, project.id, client), 'conflict', `validation changed package selection for ${project.id}`);
                 for (const item of expected) validatedSelections.add(`${project.id}\0${item.identity}\0${item.integrity}`);
+                platformSkippedCount += result.coverage.platformSkippedCount;
                 executableResults.push(...Object.entries(result.executables).map(([name, output]) => ({ name, output })));
               }
             }
             const invalidRequest = staticServer.requests.find(request => request.prefix === null);
             if (invalidRequest) return yield* Effect.fail(new MynpmError('conflict', `validation served a request outside the local static site: ${invalidRequest.pathname}`));
+            const servingFailure = staticServer.requests.find(request => {
+              const platformSkip = request.pathname.endsWith('/current/-/tarballs/unavailable.tgz') && request.method === 'GET' && request.status === 404 && request.complete;
+              return !request.complete || (request.status !== 200 && !platformSkip);
+            });
+            if (servingFailure) {
+              return yield* Effect.fail(new MynpmError('conflict', `local static server returned HTTP ${servingFailure.status ?? 'incomplete'} for ${servingFailure.pathname}`));
+            }
             if (validatedSelections.size > 0 && staticServer.requests.length === 0) {
               return yield* Effect.fail(new MynpmError('operation', 'package manager made no requests to the local static site'));
             }
@@ -884,6 +1359,7 @@ export function validateInventory(
               nodeVersion: process.version,
               target: target.id,
               packageCount: validatedSelections.size,
+              platformSkippedCount,
               projectCount: projects.length,
               rootCount: projects.reduce((count, project) => count + project.roots.length, 0),
               requestCount: staticServer.requests.length,

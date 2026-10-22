@@ -143,6 +143,14 @@ function assertEffectRejects(effect, expected) {
   });
 }
 
+function assertFailureCategory(effect, category) {
+  return Effect.gen(function*() {
+    const outcome = yield* Effect.result(effect);
+    assert.equal(outcome._tag, 'Failure');
+    if (outcome._tag === 'Failure') assert.equal(outcome.failure.category, category);
+  });
+}
+
 function publishOptions(directory, stateDirectory, siteDirectory, overrides = {}) {
   return {
     stateDirectory,
@@ -189,6 +197,8 @@ it.effect('publish creates complete immutable generations, retains old versions,
   assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
   assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'current', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
   assert.equal(statSync(join(siteDirectory, 'mirror', 'current', 'tarballs', `${first.artifact.sha512}.tgz`)).ino, statSync(join(siteDirectory, 'mirror', 'tarballs', `${first.artifact.sha512}.tgz`)).ino);
+  assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'current', '-', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
+  assert.equal(statSync(join(siteDirectory, 'mirror', 'current', '-', 'tarballs', `${first.artifact.sha512}.tgz`)).ino, statSync(join(siteDirectory, 'mirror', 'tarballs', `${first.artifact.sha512}.tgz`)).ino);
 
   const noOp = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   assert.equal(noOp.noOp, true);
@@ -203,8 +213,9 @@ it.effect('publish creates complete immutable generations, retains old versions,
   assert.equal(existsSync(join(siteDirectory, 'mirror', firstTarget, 'manifest.json')), true);
   assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
   assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'current', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
+  assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'current', '-', 'tarballs', `${first.artifact.sha512}.tgz`)), first.bytes);
   const scoped = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', '@scope', 'demo'), 'utf8'));
-  assert.equal(scoped.versions['2.3.4'].dist.tarball, `https://deps.example.net/mirror/current/tarballs/${second.artifact.sha512}.tgz`);
+  assert.equal(scoped.versions['2.3.4'].dist.tarball, `https://deps.example.net/mirror/current/-/tarballs/${second.artifact.sha512}.tgz`);
   const repeated = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   assert.equal(repeated.noOp, true);
   assert.equal(repeated.generationId, expanded.generationId);
@@ -236,10 +247,118 @@ it.effect('publish upgrades renderer-version-1 generations without losing their 
 
   const upgraded = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
   assert.equal(upgraded.noOp, false);
-  assert.equal(JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'manifest.json'), 'utf8')).rendererVersion, 2);
+  assert.equal(JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'manifest.json'), 'utf8')).rendererVersion, 3);
   assert.equal(existsSync(oldGenerationDirectory), true);
   const currentPackument = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'flatdemo'), 'utf8'));
-  assert.equal(currentPackument.versions['1.2.3'].dist.tarball, `https://deps.example.net/mirror/current/tarballs/${pkg.artifact.sha512}.tgz`);
+  assert.equal(currentPackument.versions['1.2.3'].dist.tarball, `https://deps.example.net/mirror/current/-/tarballs/${pkg.artifact.sha512}.tgz`);
+})));
+
+it.effect('publish reads and migrates renderer-version-2 generations', () => withScratch(directory => Effect.gen(function*() {
+  const stateDirectory = join(directory, 'state');
+  const siteDirectory = join(directory, 'site');
+  const pkg = makePackage('flatdemo', '1.2.3');
+  yield* saveState(stateDirectory, [pkg]);
+  yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+
+  const publicBaseUrl = config.publicBaseUrl;
+  const artifacts = makeInventory([pkg]).artifacts;
+  const packuments = renderPackumentFiles(artifacts, publicBaseUrl, { renderer: 2 });
+  const oldGenerationId = generationId(publicBaseUrl, artifacts, packuments, 2);
+  const oldGenerationDirectory = join(siteDirectory, 'mirror', 'generations', oldGenerationId);
+  mkdirSync(join(oldGenerationDirectory, 'tarballs'), { recursive: true });
+  for (const file of packuments) writeFileSync(join(oldGenerationDirectory, file.path), file.bytes);
+  writeFileSync(join(oldGenerationDirectory, 'tarballs', `${pkg.artifact.sha512}.tgz`), pkg.bytes);
+  writeFileSync(join(oldGenerationDirectory, 'manifest.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    rendererVersion: 2,
+    publicBaseUrl,
+    generationId: oldGenerationId,
+    artifacts,
+  }, null, 2)}\n`);
+  unlinkSync(join(siteDirectory, 'mirror', 'current'));
+  symlinkSync(`generations/${oldGenerationId}`, join(siteDirectory, 'mirror', 'current'));
+
+  const upgraded = yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  assert.equal(upgraded.noOp, false);
+  assert.equal(JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'manifest.json'), 'utf8')).rendererVersion, 3);
+  assert.equal(existsSync(oldGenerationDirectory), true);
+  const currentPackument = JSON.parse(readFileSync(join(siteDirectory, 'mirror', 'current', 'flatdemo'), 'utf8'));
+  assert.equal(currentPackument.versions['1.2.3'].dist.tarball, `https://deps.example.net/mirror/current/-/tarballs/${pkg.artifact.sha512}.tgz`);
+})));
+
+it.effect('publish rejects extra files in a generation', () => withScratch(directory => Effect.gen(function*() {
+  const stateDirectory = join(directory, 'state');
+  const siteDirectory = join(directory, 'site');
+  const pkg = makePackage('flatdemo', '1.2.3');
+  yield* saveState(stateDirectory, [pkg]);
+  yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  const unexpectedFile = join(siteDirectory, 'mirror', 'current', 'unexpected.txt');
+  writeFileSync(unexpectedFile, 'extra');
+
+  yield* assertFailureCategory(publishSite(publishOptions(directory, stateDirectory, siteDirectory)), 'corrupt');
+  assert.equal(readFileSync(unexpectedFile, 'utf8'), 'extra');
+})));
+
+it.effect('publish never replaces a competing shared tarball and categorizes digest mismatch as corrupt', () => withScratch(directory => Effect.gen(function*() {
+  const stateDirectory = join(directory, 'state');
+  const siteDirectory = join(directory, 'site');
+  const pkg = makePackage('flatdemo', '1.2.3');
+  yield* saveState(stateDirectory, [pkg]);
+  const sharedTarball = join(siteDirectory, 'mirror', 'tarballs', `${pkg.artifact.sha512}.tgz`);
+  const competingBytes = Buffer.from('competing writer bytes');
+  let raceCreated = false;
+
+  yield* assertFailureCategory(publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
+    link: async (source, destination) => {
+      if (!raceCreated && destination === sharedTarball) {
+        raceCreated = true;
+        writeFileSync(destination, competingBytes, { flag: 'wx' });
+      }
+      const { link } = await import('node:fs/promises');
+      return link(source, destination);
+    },
+  }), 'corrupt');
+
+  assert.equal(raceCreated, true);
+  assert.deepEqual(readFileSync(sharedTarball), competingBytes);
+  assert.equal(existsSync(join(siteDirectory, 'mirror', 'current')), false);
+})));
+
+it.effect('publish keeps the current generation active until shared tarballs are linked', () => withScratch(directory => Effect.gen(function*() {
+  const stateDirectory = join(directory, 'state');
+  const siteDirectory = join(directory, 'site');
+  const original = makePackage('flatdemo', '1.2.3');
+  const addition = makePackage('next-package', '1.0.0');
+  yield* saveState(stateDirectory, [original]);
+  yield* publishSite(publishOptions(directory, stateDirectory, siteDirectory));
+  const originalTarget = currentTarget(siteDirectory);
+  yield* saveState(stateDirectory, [addition], 'next');
+
+  let markTarball;
+  let releaseTarball;
+  const tarballReached = new Promise(resolve => { markTarball = resolve; });
+  const tarballBarrier = new Promise(resolve => { releaseTarball = resolve; });
+  try {
+    const publish = yield* Effect.forkChild(publishSite(publishOptions(directory, stateDirectory, siteDirectory), {
+      link: async (source, destination) => {
+        if (destination === join(siteDirectory, 'mirror', 'tarballs', `${addition.artifact.sha512}.tgz`)) {
+          markTarball();
+          await tarballBarrier;
+        }
+        const { link } = await import('node:fs/promises');
+        return link(source, destination);
+      },
+    }));
+    yield* promiseEffect(() => tarballReached);
+    assert.equal(currentTarget(siteDirectory), originalTarget);
+    assert.equal(existsSync(join(siteDirectory, 'mirror', 'current', 'next-package')), false);
+    releaseTarball();
+    yield* Fiber.join(publish);
+    assert.notEqual(currentTarget(siteDirectory), originalTarget);
+    assert.deepEqual(readFileSync(join(siteDirectory, 'mirror', 'current', '-', 'tarballs', `${addition.artifact.sha512}.tgz`)), addition.bytes);
+  } finally {
+    releaseTarball?.();
+  }
 })));
 
 it.effect('publish rejects symbolic-link destination components', () => withScratch(directory => Effect.gen(function*() {
@@ -380,7 +499,7 @@ function startStaticServer(siteDirectory) {
     }
     try {
       const bytes = readFileSync(sitePath);
-      const isMetadata = pathname.includes('/current/') && !pathname.includes('/current/tarballs/');
+      const isMetadata = pathname.includes('/current/') && !pathname.includes('/tarballs/');
       response.writeHead(200, {
         'Content-Type': isMetadata ? 'application/json' : 'application/octet-stream',
         'Cache-Control': isMetadata ? 'no-cache' : 'public, max-age=31536000, immutable',
@@ -510,10 +629,12 @@ it.effect('published root and /mirror/ static URLs serve installable packages an
   assert.equal(prefixResult.stderr, '');
   const pnpmVersionResult = yield* Effect.result(runProcess('pnpm', ['--version'], { cwd: directory, env, timeoutMs: 30_000 }));
   const pnpmVersion = pnpmVersionResult._tag === 'Success' ? pnpmVersionResult.success.stdout.trim().split(/\s+/)[0] : 'unavailable';
-  if (process.version === 'v24.22.0' && pnpmVersion === '12.15.0') {
+  if (process.version === 'v26.12.0' && pnpmVersion === '12.15.0') {
     const prefixPnpmProject = join(directory, 'prefix-pnpm-project');
     mkdirSync(prefixPnpmProject);
     yield* installWithPnpm(prefixPnpmProject, `${serverBase}current/`, join(directory, 'prefix-pnpm'), env);
+  } else if (process.env.MYNPM_REQUIRE_STATIC_CLIENTS === '1') {
+    assert.fail(`Node 26.12.0 and pnpm 12.15.0 are required; found Node ${process.version}, pnpm ${pnpmVersion}`);
   } else {
     console.info(`pnpm 12.15.0 proof skipped; found Node ${process.version}, pnpm ${pnpmVersion}`);
   }
@@ -541,10 +662,12 @@ it.effect('published root and /mirror/ static URLs serve installable packages an
     env,
     timeoutMs: 30_000,
   });
-  if (process.version === 'v24.22.0' && pnpmVersion === '12.15.0') {
+  if (process.version === 'v26.12.0' && pnpmVersion === '12.15.0') {
     const rootPnpmProject = join(directory, 'root-pnpm-project');
     mkdirSync(rootPnpmProject);
     yield* installWithPnpm(rootPnpmProject, `${rootBase}current/`, join(directory, 'root-pnpm'), env);
+  } else if (process.env.MYNPM_REQUIRE_STATIC_CLIENTS === '1') {
+    assert.fail(`Node 26.12.0 and pnpm 12.15.0 are required; found Node ${process.version}, pnpm ${pnpmVersion}`);
   }
   yield* runProcess('npm', ['ci', `--registry=${rootBase}current/`, `--cache=${join(directory, 'root-ci-cache')}`, '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
     cwd: rootProject,
@@ -557,9 +680,29 @@ it.effect('published root and /mirror/ static URLs serve installable packages an
     timeoutMs: 30_000,
   });
 
+  const strictProject = join(directory, 'strict-project');
+  mkdirSync(strictProject);
+  writeFileSync(join(strictProject, 'package.json'), '{"name":"consumer-strict","version":"1.0.0","private":true}\n');
+  const strictCache = join(directory, 'strict-cache');
+  yield* runProcess('npm', ['install', '@flatrepo/demo@2.3.4', `--registry=${rootBase}current/`, `--cache=${strictCache}`, '--allow-remote=none', '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
+    cwd: strictProject,
+    env: { ...env, npm_config_cache: strictCache },
+    timeoutMs: 240_000,
+  });
+  yield* runProcess('npm', ['ci', `--registry=${rootBase}current/`, `--cache=${join(directory, 'strict-ci-cache')}`, '--allow-remote=none', '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'], {
+    cwd: strictProject,
+    env: { ...env, npm_config_cache: join(directory, 'strict-ci-cache') },
+    timeoutMs: 240_000,
+  });
+  yield* runProcess(process.execPath, ['-e', "if (require('@flatrepo/demo') !== 'static registry works (via @flatrepo/demo)') process.exit(1)"], {
+    cwd: strictProject,
+    env,
+    timeoutMs: 30_000,
+  });
+
   const lock = JSON.parse(readFileSync(join(rootProject, 'package-lock.json'), 'utf8'));
-  assert.equal(lock.packages['node_modules/flatdemo'].resolved, `${rootBase}current/tarballs/${flatdemo.artifact.sha512}.tgz`);
-  assert.equal(lock.packages['node_modules/@flatrepo/demo'].resolved, `${rootBase}current/tarballs/${scoped.artifact.sha512}.tgz`);
+  assert.equal(lock.packages['node_modules/flatdemo'].resolved, `${rootBase}current/-/tarballs/${flatdemo.artifact.sha512}.tgz`);
+  assert.equal(lock.packages['node_modules/@flatrepo/demo'].resolved, `${rootBase}current/-/tarballs/${scoped.artifact.sha512}.tgz`);
   assert.equal(staticSite.requests.some(path => path === '/mirror/current/@flatrepo/demo'), true);
   assert.equal(staticSite.requests.some(path => path === '/current/@flatrepo/demo'), true);
   assert.equal(staticSite.requests.every(path => path.startsWith('/mirror/current/') || path.startsWith('/mirror/tarballs/') || path.startsWith('/current/') || path.startsWith('/tarballs/')), true);

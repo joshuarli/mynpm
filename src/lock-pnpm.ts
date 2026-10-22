@@ -176,6 +176,16 @@ function snapshotReference(key: string): string {
   return (key.startsWith('/') ? key.slice(1) : key).split('(', 1)[0];
 }
 
+function snapshotDependencyReference(name: string, reference: string): string | null {
+  const normalized = reference.startsWith('npm:') ? reference.slice(4) : reference;
+  if (/^(?:link|file|workspace):/i.test(normalized)) return null;
+  const packageSeparator = normalized.indexOf('@');
+  const peerSuffix = normalized.indexOf('(');
+  return packageSeparator >= 0 && (peerSuffix < 0 || packageSeparator < peerSuffix)
+    ? normalized.startsWith('/') ? normalized.slice(1) : normalized
+    : `${name}@${normalized}`;
+}
+
 function packageReferenceMatches(reference: string, requestedName: string, packageRecord: PackageRecord): boolean {
   const packageKey = packageRecord.key.startsWith('/') ? packageRecord.key.slice(1) : packageRecord.key;
   const candidate = reference.startsWith('npm:') ? reference.slice(4) : reference;
@@ -189,8 +199,9 @@ function packageReferenceMatches(reference: string, requestedName: string, packa
       if (!(error instanceof MynpmError)) throw error;
     }
   }
-  if (identity.name === requestedName && candidate === identity.reference) return true;
-  return candidate === identity.version && identity.name === requestedName;
+  const candidateBase = candidate.split('(', 1)[0];
+  if (identity.name === requestedName && candidateBase === identity.reference.split('(', 1)[0]) return true;
+  return candidateBase === identity.version && identity.name === requestedName;
 }
 
 function parsePackageEntry(key: string, entryValue: unknown, targets: string[]): PackageRecord {
@@ -256,13 +267,14 @@ function importerRoots(document: JsonRecord, packageEntries: Map<string, Package
           packageVersion = null;
         } else {
           const target = reference.startsWith('npm:') ? reference.slice(4) : reference;
-          const separator = target.startsWith('@') ? target.indexOf('@', target.indexOf('/') + 1) : target.indexOf('@');
+          const targetBase = target.split('(', 1)[0];
+          const separator = targetBase.startsWith('@') ? targetBase.indexOf('@', targetBase.indexOf('/') + 1) : targetBase.indexOf('@');
           if (separator > 0) {
-            packageName = requirePackageName(target.slice(0, separator), `${importerLabel} dependency target`);
-            const targetVersion = target.slice(separator + 1).split('(', 1)[0];
+            packageName = requirePackageName(targetBase.slice(0, separator), `${importerLabel} dependency target`);
+            const targetVersion = targetBase.slice(separator + 1);
             packageVersion = versionPattern.test(targetVersion) ? targetVersion : null;
-          } else if (versionPattern.test(target)) {
-            packageVersion = target;
+          } else if (versionPattern.test(targetBase)) {
+            packageVersion = targetBase;
           }
         }
         roots.push({ importer: importerPath, requestedName, specifier, packageName, packageVersion, group, packageKey });
@@ -277,6 +289,8 @@ function parsePnpmDocuments(values: unknown, { projectId, packageManagerPin = nu
   const targets = normalizeTargets(targetIds);
   const packagesByKey = new Map<string, PackageRecord>();
   const snapshotKeys = new Set<string>();
+  const snapshotEntries = new Set<string>();
+  const snapshotReferences = new Set<string>();
   const importerPaths = new Set<string>();
   const roots: RootDependency[] = [];
   for (const [index, document] of documents.entries()) {
@@ -297,9 +311,17 @@ function parsePnpmDocuments(values: unknown, { projectId, packageManagerPin = nu
     for (const [key, snapshotValue] of Object.entries(snapshots)) {
       const snapshotEntry = requireRecord(snapshotValue, `pnpm lockfile snapshots[${JSON.stringify(key)}]`);
       for (const group of ['dependencies', 'optionalDependencies'] as const) {
-        if (snapshotEntry[group] !== undefined) requireRecord(snapshotEntry[group], `pnpm lockfile snapshots[${JSON.stringify(key)}].${group}`);
+        if (snapshotEntry[group] === undefined) continue;
+        const dependencies = requireRecord(snapshotEntry[group], `pnpm lockfile snapshots[${JSON.stringify(key)}].${group}`);
+        for (const [name, referenceValue] of Object.entries(dependencies)) {
+          requirePackageName(name, `pnpm lockfile snapshots[${JSON.stringify(key)}].${group} dependency name`);
+          const reference = requireText(referenceValue, `pnpm lockfile snapshots[${JSON.stringify(key)}].${group}[${JSON.stringify(name)}]`);
+          const normalized = snapshotDependencyReference(name, reference);
+          if (normalized !== null) snapshotReferences.add(normalized);
+        }
       }
       snapshotKeys.add(snapshotReference(key));
+      snapshotEntries.add(key.startsWith('/') ? key.slice(1) : key);
     }
     roots.push(...importerRoots(document, packagesByKey, `pnpm lockfile document ${index + 1}`));
   }
@@ -308,6 +330,8 @@ function parsePnpmDocuments(values: unknown, { projectId, packageManagerPin = nu
       invalid(`pnpm snapshot has no matching package entry: ${snapshot}`);
     }
   }
+  const missingSnapshot = [...snapshotReferences].find(reference => !snapshotEntries.has(reference));
+  if (missingSnapshot !== undefined) invalid(`pnpm snapshot dependency has no matching snapshot: ${missingSnapshot}`);
   const uniqueRoots = new Map<string, RootDependency>();
   for (const root of roots) {
     const key = JSON.stringify(root);

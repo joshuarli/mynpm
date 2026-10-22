@@ -852,7 +852,7 @@ function writeStage(
     handleClosed = true;
     const inspected = yield* Effect.mapError(
       inspectPackageArchive(stagePath, { name: task.name, version: task.version }),
-      cause => new MynpmError('operation', cause.message, { cause }),
+      cause => new MynpmError('operation', `could not inspect package archive for ${task.name}@${task.version}: ${cause.message}`, { cause }),
     );
     yield* Effect.try({ try: () => validatePlatformClaims(task.records, inspected.manifest), catch: cause => asMynpmError(cause, 'conflict', `staged package metadata conflicts for ${task.name}@${task.version}`) });
     yield* Effect.try({ try: () => validatePlatformClaims(task.records, task.metadata), catch: cause => asMynpmError(cause, 'conflict', `upstream package metadata conflicts for ${task.name}@${task.version}`) });
